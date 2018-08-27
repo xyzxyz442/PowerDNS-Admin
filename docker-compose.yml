@@ -86,7 +86,7 @@ services:
     ports:
       - '9191:9191'
     links: 
-      - pdns-admin-ad-master:db-admin
+      - pdns-admin-db-master:db-admin
     volumes:
       # Code
       - .:/powerdns-admin/
