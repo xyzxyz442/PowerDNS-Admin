@@ -71,19 +71,33 @@ services:
   pdns:
     image: psitrax/powerdns:latest
     ports:
-      - '53:53'
-      - '53:53/udp'
+      - '5300:5300'
+      - '5300:5300/udp'
     links: 
       - pdns-db-master:db
-    command: --api=yes --api-key=${PDNS_API_KEY} --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0
+    command: [
+      '--api=yes', '--api-key=${PDNS_API_KEY}',
+      '--log-dns-details=yes', '--log-dns-queries=yes',
+      '--webserver-address=0.0.0.0', '--webserver-allow-from=0.0.0.0/0']
     environment:
       - MYSQL_HOST=db
       - MYSQL_USER=${PDNS_DB_USER}
       - MYSQL_PASS=${PDNS_DB_PASSWORD}
-      - PDNS_API_KEY=${PDNS_API_KEY}
-      - PDNS_WEBSERVER_ALLOW_FROM=${PDNS_WEBSERVER_ALLOW_FROM}
     depends_on: 
       - pdns-db-master
+
+  pdns-recursor:
+    build:
+      context: .
+      dockerfile: docker/pdns-recursor/Dockerfile
+    image: pdns-recursor
+    ports:
+      - '53:53/tcp'
+      - '53:53/udp'
+    enviroment:
+      - PDNS_forward_zones=${PDNS_RECURSOR_FORWARD_ZONES}
+    depends_on:
+      - pdns
 
   pdns-admin:
     build:
