@@ -1,16 +1,86 @@
-version: "2.1"
+version: '3.7'
 
 services:
-  powerdns-admin:
+  pdns-db-master:
+    image: bitnami/mariadb:latest
+    ports:
+      - '3306'
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MARIADB_REPLICATION_MODE=master
+      - MARIADB_REPLICATION_USER=repl_user
+      - MARIADB_REPLICATION_PASSWORD=repl_password
+      - MARIADB_DATABASE=${PDNS_DB_NAME}
+      - MARIADB_USER=${PDNS_DB_USER}
+      - MARIADB_PASSWORD=${PDNS_DB_PASSWORD}
+    volumes:
+      - '${PDNS_DB_DATA_PATH}:/bitnami'
+
+  pdns-db-slave:
+    image: 'bitnami/mariadb:latest'
+    ports:
+      - '3306'
+    depends_on:
+      - pdns-db-master
+    environment:
+      - MARIADB_REPLICATION_MODE=slave
+      - MARIADB_REPLICATION_USER=repl_user
+      - MARIADB_REPLICATION_PASSWORD=repl_password
+      - MARIADB_MASTER_HOST=pdns-db-master
+      - MARIADB_MASTER_PORT_NUMBER=3306
+      - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+
+  pdns-admin-db-master:
+    image: bitnami/mariadb:latest
+    ports:
+      - '3306'
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MARIADB_REPLICATION_MODE=master
+      - MARIADB_REPLICATION_USER=repl_user
+      - MARIADB_REPLICATION_PASSWORD=repl_password
+      - MARIADB_DATABASE=${PDA_DB_NAME}
+      - MARIADB_USER=${PDA_DB_USER}
+      - MARIADB_PASSWORD=${PDA_DB_PASSWORD}
+    volumes:
+      - '${PDA_DB_DATA_PATH}:/bitnami'
+
+  pdns-admin-db-slave:
+    image: 'bitnami/mariadb:latest'
+    ports:
+      - '3306'
+    depends_on:
+      - pdns-admin-db-master
+    environment:
+      - MARIADB_REPLICATION_MODE=slave
+      - MARIADB_REPLICATION_USER=repl_user
+      - MARIADB_REPLICATION_PASSWORD=repl_password
+      - MARIADB_MASTER_HOST=pdns-admin-db-master
+      - MARIADB_MASTER_PORT_NUMBER=3306
+      - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+
+  pdns:
+    image: psitrax/powerdns:latest
+    ports:
+      - '53:53'
+      - '53:53/udp'
+    command: --api=yes --api-key=${PDNS_API_KEY} --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0
+    environment:
+      - MYSQL_HOST=pdns-db-master
+      - MYSQL_USER=${PDNS_DB_USER}
+      - MYSQL_PASS=${PDNS_DB_PASSWORD}
+      - PDNS_API_KEY=${PDNS_API_KEY}
+      - PDNS_WEBSERVER_ALLOW_FROM=${PDNS_WEBSERVER_ALLOW_FROM}
+    depends_on: 
+      - pdns-db-master
+
+  pdns-admin:
     build:
       context: .
       dockerfile: docker/PowerDNS-Admin/Dockerfile
       args:
         - ENVIRONMENT=${ENVIRONMENT}
-    image: powerdns-admin
-    container_name: powerdns-admin
-    mem_limit: 256M
-    memswap_limit: 256M
+    image: pdns-admin
     ports:
       - "9191:9191"
     volumes:
@@ -20,17 +90,15 @@ services:
       # Assets dir volume
       - powerdns-admin-assets:/powerdns-admin/app/static
       - powerdns-admin-assets2:/powerdns-admin/node_modules
-      - powerdns-admin-assets3:/powerdns-admin/logs
+      - '${PDNS_ADMIN_LOGS_PATH}:/powerdns-admin/logs'
       - ./app/static/custom:/powerdns-admin/app/static/custom
     logging:
       driver: json-file
       options:
         max-size: 50m
-    networks:
-      - default
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
-      - PDA_DB_HOST=${PDA_DB_HOST}
+      - PDA_DB_HOST=pdns-admin-db-master
       - PDA_DB_NAME=${PDA_DB_NAME}
       - PDA_DB_USER=${PDA_DB_USER}
       - PDA_DB_PASSWORD=${PDA_DB_PASSWORD}
@@ -38,76 +106,9 @@ services:
       - PDNS_API_KEY=${PDNS_API_KEY}
       - FLASK_APP=/powerdns-admin/app/__init__.py
     depends_on:
-      powerdns-admin-mysql:
-        condition: service_healthy
-
-  powerdns-admin-mysql:
-    image: mysql/mysql-server:5.7
-    hostname: ${PDA_DB_HOST}
-    container_name: powerdns-admin-mysql
-    mem_limit: 256M
-    memswap_limit: 256M
-    expose:
-      - 3306
-    volumes:
-      - powerdns-admin-mysql-data:/var/lib/mysql
-    networks:
-      - default
-    environment:
-      - MYSQL_DATABASE=${PDA_DB_NAME}
-      - MYSQL_USER=${PDA_DB_USER}
-      - MYSQL_PASSWORD=${PDA_DB_PASSWORD}
-    healthcheck:
-      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 5
-
-  pdns-server:
-    image: psitrax/powerdns
-    hostname: ${PDNS_HOST}
-    ports:
-      - "53:53"
-      - "53:53/udp"
-    networks:
-      - default
-    command: --api=yes --api-key=${PDNS_API_KEY} --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0
-    environment:
-      - MYSQL_HOST=${PDNS_DB_HOST}
-      - MYSQL_USER=${PDNS_DB_USER}
-      - MYSQL_PASS=${PDNS_DB_PASSWORD}
-      - PDNS_API_KEY=${PDNS_API_KEY}
-      - PDNS_WEBSERVER_ALLOW_FROM=${PDNS_WEBSERVER_ALLOW_FROM}
-    depends_on:
-      pdns-mysql:
-        condition: service_healthy
-
-  pdns-mysql:
-    image: mysql/mysql-server:5.7
-    hostname: ${PDNS_DB_HOST}
-    container_name: ${PDNS_DB_HOST}
-    mem_limit: 256M
-    memswap_limit: 256M
-    expose:
-      - 3306
-    volumes:
-      - powerdns-mysql-data:/var/lib/mysql
-    networks:
-      - default
-    environment:
-      - MYSQL_DATABASE=${PDNS_DB_NAME}
-      - MYSQL_USER=${PDNS_DB_USER}
-      - MYSQL_PASSWORD=${PDNS_DB_PASSWORD}
-    healthcheck:
-      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
-      timeout: 10s
-      retries: 5
-
-networks:
-  default:
+      - pdns
+      - pdns-admin-db-master
 
 volumes:
-  powerdns-mysql-data:
-  powerdns-admin-mysql-data:
   powerdns-admin-assets:
   powerdns-admin-assets2:
-  powerdns-admin-assets3:
