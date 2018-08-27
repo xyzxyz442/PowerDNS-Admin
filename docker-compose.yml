@@ -64,9 +64,11 @@ services:
     ports:
       - '53:53'
       - '53:53/udp'
+    links: 
+      - pdns-db-master:db
     command: --api=yes --api-key=${PDNS_API_KEY} --webserver-address=0.0.0.0 --webserver-allow-from=0.0.0.0/0
     environment:
-      - MYSQL_HOST=pdns-db-master
+      - MYSQL_HOST=db
       - MYSQL_USER=${PDNS_DB_USER}
       - MYSQL_PASS=${PDNS_DB_PASSWORD}
       - PDNS_API_KEY=${PDNS_API_KEY}
@@ -82,7 +84,9 @@ services:
         - ENVIRONMENT=${ENVIRONMENT}
     image: pdns-admin
     ports:
-      - "9191:9191"
+      - '9191:9191'
+    links: 
+      - pdns-admin-ad-master:db-admin
     volumes:
       # Code
       - .:/powerdns-admin/
@@ -98,7 +102,7 @@ services:
         max-size: 50m
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
-      - PDA_DB_HOST=pdns-admin-db-master
+      - PDA_DB_HOST=db-admin
       - PDA_DB_NAME=${PDA_DB_NAME}
       - PDA_DB_USER=${PDA_DB_USER}
       - PDA_DB_PASSWORD=${PDA_DB_PASSWORD}
