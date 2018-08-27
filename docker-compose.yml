@@ -15,6 +15,11 @@ services:
       - MARIADB_PASSWORD=${PDNS_DB_PASSWORD}
     volumes:
       - '${PDNS_DB_DATA_PATH}:/bitnami'
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 5
+
 
   pdns-db-slave:
     image: 'bitnami/mariadb:latest'
@@ -44,6 +49,10 @@ services:
       - MARIADB_PASSWORD=${PDA_DB_PASSWORD}
     volumes:
       - '${PDA_DB_DATA_PATH}:/bitnami'
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 5
 
   pdns-admin-db-slave:
     image: 'bitnami/mariadb:latest'
