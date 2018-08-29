@@ -11,5 +11,7 @@ services:
     restart: always
   pdns:
     restart: always
+  pdns-recursor:
+    restart: always
   pdns-admin:
     restart: always
