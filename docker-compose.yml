@@ -13,13 +13,14 @@ services:
       - MARIADB_DATABASE=${PDNS_DB_NAME}
       - MARIADB_USER=${PDNS_DB_USER}
       - MARIADB_PASSWORD=${PDNS_DB_PASSWORD}
+    networks:
+      internal:
     volumes:
       - '${PDNS_DB_DATA_PATH}:/bitnami'
     healthcheck:
       test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
       timeout: 10s
       retries: 5
-
 
   pdns-db-slave:
     image: 'bitnami/mariadb:latest'
@@ -34,6 +35,8 @@ services:
       - MARIADB_MASTER_HOST=pdns-db-master
       - MARIADB_MASTER_PORT_NUMBER=3306
       - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+    networks:
+      internal:
 
   pdns-admin-db-master:
     image: bitnami/mariadb:latest
@@ -47,6 +50,8 @@ services:
       - MARIADB_DATABASE=${PDA_DB_NAME}
       - MARIADB_USER=${PDA_DB_USER}
       - MARIADB_PASSWORD=${PDA_DB_PASSWORD}
+    networks:
+      internal:
     volumes:
       - '${PDA_DB_DATA_PATH}:/bitnami'
     healthcheck:
@@ -67,24 +72,30 @@ services:
       - MARIADB_MASTER_HOST=pdns-admin-db-master
       - MARIADB_MASTER_PORT_NUMBER=3306
       - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+    networks:
+      internal:
 
   pdns:
     image: psitrax/powerdns:latest
     ports:
-      - '5300:5300'
-      - '5300:5300/udp'
+      - '5300:53'
+      - '5300:53/udp'
     links: 
       - pdns-db-master:db
     command: [
       '--api=yes', '--api-key=${PDNS_API_KEY}',
-      '--log-dns-details=yes', '--log-dns-queries=yes',
+      '--loglevel=${PDNS_LOGLEVEL}', 
+      '--log-dns-details=${PDNS_LOG_DNS_DETAILS}', '--log-dns-queries=${PDNS_LOG_DNS_QUERIES}',
       '--webserver-address=0.0.0.0', '--webserver-allow-from=0.0.0.0/0']
+    depends_on: 
+      - pdns-db-master
     environment:
       - MYSQL_HOST=db
       - MYSQL_USER=${PDNS_DB_USER}
       - MYSQL_PASS=${PDNS_DB_PASSWORD}
-    depends_on: 
-      - pdns-db-master
+    networks:
+      internal:
+        ipv4_address: ${DOCKER_PDNS_AUTHORITATIVE_IP}
 
   pdns-recursor:
     build:
@@ -94,10 +105,14 @@ services:
     ports:
       - '53:53/tcp'
       - '53:53/udp'
-    environment:
-      - PDNS_forward_zones=${PDNS_RECURSOR_FORWARD_ZONES}
     depends_on:
       - pdns
+    environment:
+      - PDNS_forward_zones=${PDNS_RECURSOR_FORWARD_ZONES}
+      - PDNS_loglevel=${PDNS_LOGLEVEL}
+      - PDNS_log_common_errors=${PDNS_RECURSOR_LOG_COMMON_ERRORS}
+    networks:
+      internal:
 
   pdns-admin:
     build:
@@ -110,6 +125,20 @@ services:
       - '9191:9191'
     links: 
       - pdns-admin-db-master:db-admin
+    depends_on:
+      - pdns
+      - pdns-admin-db-master
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - PDA_DB_HOST=db-admin
+      - PDA_DB_NAME=${PDA_DB_NAME}
+      - PDA_DB_USER=${PDA_DB_USER}
+      - PDA_DB_PASSWORD=${PDA_DB_PASSWORD}
+      - PDNS_HOST=${PDNS_HOST}
+      - PDNS_API_KEY=${PDNS_API_KEY}
+      - FLASK_APP=/powerdns-admin/app/__init__.py
+    networks:
+      internal:
     volumes:
       # Code
       - .:/powerdns-admin/
@@ -123,18 +152,13 @@ services:
       driver: json-file
       options:
         max-size: 50m
-    environment:
-      - ENVIRONMENT=${ENVIRONMENT}
-      - PDA_DB_HOST=db-admin
-      - PDA_DB_NAME=${PDA_DB_NAME}
-      - PDA_DB_USER=${PDA_DB_USER}
-      - PDA_DB_PASSWORD=${PDA_DB_PASSWORD}
-      - PDNS_HOST=${PDNS_HOST}
-      - PDNS_API_KEY=${PDNS_API_KEY}
-      - FLASK_APP=/powerdns-admin/app/__init__.py
-    depends_on:
-      - pdns
-      - pdns-admin-db-master
+
+networks:
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET}
 
 volumes:
   powerdns-admin-assets:
