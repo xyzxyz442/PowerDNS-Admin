@@ -109,6 +109,7 @@ services:
       - pdns
     environment:
       - PDNS_forward_zones=${PDNS_RECURSOR_FORWARD_ZONES}
+      - PDNS_forward_zones_recurse=${PDNS_RECURSOR_FORWARD_ZONES}
       - PDNS_loglevel=${PDNS_LOGLEVEL}
       - PDNS_log_common_errors=${PDNS_RECURSOR_LOG_COMMON_ERRORS}
     networks:
