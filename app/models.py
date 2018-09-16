@@ -1,60 +1,30 @@
+import sys
 import os
+import re
 import ldap
 import ldap.filter
-import time
 import base64
 import bcrypt
 import itertools
 import traceback
 import pyotp
-import re
 import dns.reversename
-import sys
+import dns.inet
+import dns.name
 import logging as logger
 
+from ast import literal_eval
 from datetime import datetime
 from urllib.parse import urljoin
 from distutils.util import strtobool
 from distutils.version import StrictVersion
 from flask_login import AnonymousUserMixin
 
-from app import app, db
+from app import db
 from app.lib import utils
 
 logging = logger.getLogger(__name__)
 
-if 'LDAP_TYPE' in app.config.keys():
-    LDAP_URI = app.config['LDAP_URI']
-    LDAP_SEARCH_BASE = app.config['LDAP_SEARCH_BASE']
-    LDAP_TYPE = app.config['LDAP_TYPE']
-    LDAP_FILTER = app.config['LDAP_FILTER']
-    LDAP_USERNAMEFIELD = app.config['LDAP_USERNAMEFIELD']
-
-    LDAP_GROUP_SECURITY = app.config.get('LDAP_GROUP_SECURITY')
-    if LDAP_GROUP_SECURITY == True:
-        LDAP_ADMIN_GROUP = app.config['LDAP_ADMIN_GROUP']
-        LDAP_USER_GROUP = app.config['LDAP_USER_GROUP']
-else:
-    LDAP_TYPE = False
-
-if 'PRETTY_IPV6_PTR' in app.config.keys():
-    import dns.inet
-    import dns.name
-    PRETTY_IPV6_PTR = app.config['PRETTY_IPV6_PTR']
-else:
-    PRETTY_IPV6_PTR = False
-
-PDNS_STATS_URL = app.config['PDNS_STATS_URL']
-PDNS_API_KEY = app.config['PDNS_API_KEY']
-PDNS_VERSION = app.config['PDNS_VERSION']
-API_EXTENDED_URL = utils.pdns_api_extended_uri(PDNS_VERSION)
-
-# Flag for pdns v4.x.x
-# TODO: Find another way to do this
-if StrictVersion(PDNS_VERSION) >= StrictVersion('4.0.0'):
-    NEW_SCHEMA = True
-else:
-    NEW_SCHEMA = False
 
 class Anonymous(AnonymousUserMixin):
   def __init__(self):
@@ -125,7 +95,7 @@ class User(db.Model):
     def get_hashed_password(self, plain_text_password=None):
         # Hash a password for the first time
         #   (Using bcrypt, the salt is saved into the hash itself)
-        if plain_text_password == None:
+        if plain_text_password is None:
             return plain_text_password
 
         pw = plain_text_password if plain_text_password else self.plain_text_password
@@ -147,7 +117,7 @@ class User(db.Model):
 
     def ldap_init_conn(self):
         ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
-        conn = ldap.initialize(LDAP_URI)
+        conn = ldap.initialize(Setting().get('ldap_uri'))
         conn.set_option(ldap.OPT_REFERRALS, ldap.OPT_OFF)
         conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
         conn.set_option(ldap.OPT_X_TLS,ldap.OPT_X_TLS_DEMAND)
@@ -162,7 +132,7 @@ class User(db.Model):
 
         try:
             conn = self.ldap_init_conn()
-            conn.simple_bind_s(app.config['LDAP_ADMIN_USERNAME'], app.config['LDAP_ADMIN_PASSWORD'])
+            conn.simple_bind_s(Setting().get('ldap_admin_username'), Setting().get('ldap_admin_password'))
             ldap_result_id = conn.search(baseDN, searchScope, searchFilter, retrieveAttributes)
             result_set = []
 
@@ -177,7 +147,9 @@ class User(db.Model):
 
         except ldap.LDAPError as e:
             logging.error(e)
-            raise
+            logging.debug('baseDN: {0}'.format(baseDN))
+            logging.debug(traceback.format_exc())
+
 
     def ldap_auth(self, ldap_username, password):
         try:
@@ -192,6 +164,8 @@ class User(db.Model):
         """
         Validate user credential
         """
+        role_name = 'User'
+
         if method == 'LOCAL':
             user_info = User.query.filter(User.username == self.username).first()
 
@@ -206,35 +180,60 @@ class User(db.Model):
             return False
 
         if method == 'LDAP':
-            isadmin = False
-            if not LDAP_TYPE:
-                logging.error('LDAP authentication is disabled')
-                return False
+            LDAP_TYPE = Setting().get('ldap_type')
+            LDAP_BASE_DN = Setting().get('ldap_base_dn')
+            LDAP_FILTER_BASIC = Setting().get('ldap_filter_basic')
+            LDAP_FILTER_USERNAME = Setting().get('ldap_filter_username')
+            LDAP_ADMIN_GROUP = Setting().get('ldap_admin_group')
+            LDAP_OPERATOR_GROUP = Setting().get('ldap_operator_group')
+            LDAP_USER_GROUP = Setting().get('ldap_user_group')
+            LDAP_GROUP_SECURITY_ENABLED = Setting().get('ldap_sg_enabled')
 
-            if LDAP_TYPE == 'ldap':
-                searchFilter = "(&({0}={1}){2})".format(LDAP_USERNAMEFIELD, self.username, LDAP_FILTER)
-                logging.debug('Ldap searchFilter "{0}"'.format(searchFilter))
-            elif LDAP_TYPE == 'ad':
-                searchFilter = "(&(objectcategory=person)({0}={1}){2})".format(LDAP_USERNAMEFIELD, self.username, LDAP_FILTER)
+            searchFilter = "(&({0}={1}){2})".format(LDAP_FILTER_USERNAME, self.username, LDAP_FILTER_BASIC)
+            logging.debug('Ldap searchFilter {0}'.format(searchFilter))
 
-            ldap_result = self.ldap_search(searchFilter, LDAP_SEARCH_BASE)
+            ldap_result = self.ldap_search(searchFilter, LDAP_BASE_DN)
+            logging.debug('Ldap search result: {0}'.format(ldap_result))
+
             if not ldap_result:
                 logging.warning('LDAP User "{0}" does not exist. Authentication request from {1}'.format(self.username, src_ip))
                 return False
             else:
                 try:
                     ldap_username = ldap.filter.escape_filter_chars(ldap_result[0][0][0])
-                    # check if LDAP_SECURITY_GROUP is enabled
+                    # check if LDAP_GROUP_SECURITY_ENABLED is True
                     # user can be assigned to ADMIN or USER role.
-                    if LDAP_GROUP_SECURITY:
+                    if LDAP_GROUP_SECURITY_ENABLED:
                         try:
-                            if (self.ldap_search(searchFilter, LDAP_ADMIN_GROUP)):
-                                isadmin = True
-                                logging.info('User {0} is part of the "{1}" group that allows admin access to PowerDNS-Admin'.format(self.username,LDAP_ADMIN_GROUP))
-                            elif (self.ldap_search(searchFilter, LDAP_USER_GROUP)):
-                                logging.info('User {0} is part of the "{1}" group that allows user access to PowerDNS-Admin'.format(self.username,LDAP_USER_GROUP))
+                            if LDAP_TYPE == 'ldap':
+                                if (self.ldap_search(searchFilter, LDAP_ADMIN_GROUP)):
+                                    role_name = 'Administrator'
+                                    logging.info('User {0} is part of the "{1}" group that allows admin access to PowerDNS-Admin'.format(self.username, LDAP_ADMIN_GROUP))
+                                elif (self.ldap_search(searchFilter, LDAP_OPERATOR_GROUP)):
+                                    role_name = 'Operator'
+                                    logging.info('User {0} is part of the "{1}" group that allows operator access to PowerDNS-Admin'.format(self.username, LDAP_OPERATOR_GROUP))
+                                elif (self.ldap_search(searchFilter, LDAP_USER_GROUP)):
+                                    logging.info('User {0} is part of the "{1}" group that allows user access to PowerDNS-Admin'.format(self.username, LDAP_USER_GROUP))
+                                else:
+                                    logging.error('User {0} is not part of the "{1}", "{2}" or "{3}" groups that allow access to PowerDNS-Admin'.format(self.username, LDAP_ADMIN_GROUP, LDAP_OPERATOR_GROUP, LDAP_USER_GROUP))
+                                    return False
+                            elif LDAP_TYPE == 'ad':
+                                user_ldap_groups = [g.decode("utf-8") for g in ldap_result[0][0][1]['memberOf']]
+                                logging.debug('user_ldap_groups: {0}'.format(user_ldap_groups))
+
+                                if (LDAP_ADMIN_GROUP in user_ldap_groups):
+                                    role_name = 'Administrator'
+                                    logging.info('User {0} is part of the "{1}" group that allows admin access to PowerDNS-Admin'.format(self.username, LDAP_ADMIN_GROUP))
+                                elif (LDAP_OPERATOR_GROUP in user_ldap_groups):
+                                    role_name = 'Operator'
+                                    logging.info('User {0} is part of the "{1}" group that allows operator access to PowerDNS-Admin'.format(self.username, LDAP_OPERATOR_GROUP))
+                                elif (LDAP_USER_GROUP in user_ldap_groups):
+                                    logging.info('User {0} is part of the "{1}" group that allows user access to PowerDNS-Admin'.format(self.username, LDAP_USER_GROUP))
+                                else:
+                                    logging.error('User {0} is not part of the "{1}", "{2}" or "{3}" groups that allow access to PowerDNS-Admin'.format(self.username, LDAP_ADMIN_GROUP, LDAP_OPERATOR_GROUP, LDAP_USER_GROUP))
+                                    return False
                             else:
-                                logging.error('User {0} is not part of the "{1}" or "{2}" groups that allow access to PowerDNS-Admin'.format(self.username,LDAP_ADMIN_GROUP,LDAP_USER_GROUP))
+                                logging.error('Invalid LDAP type')
                                 return False
                         except Exception as e:
                             logging.error('LDAP group lookup for user "{0}" has failed. Authentication request from {1}'.format(self.username, src_ip))
@@ -256,32 +255,31 @@ class User(db.Model):
                 self.firstname = self.username
                 self.lastname = ''
                 try:
-                    # try to get user's firstname & lastname from LDAP
-                    # this might be changed in the future
-                    self.firstname = ldap_result[0][0][1]['givenName'][0].decode("utf-8")
-                    self.lastname = ldap_result[0][0][1]['sn'][0].decode("utf-8")
-                    self.email = ldap_result[0][0][1]['mail'][0].decode("utf-8")
+                    # try to get user's firstname, lastname and email address from LDAP attributes
+                    if LDAP_TYPE == 'ldap':
+                        self.firstname = ldap_result[0][0][1]['givenName'][0].decode("utf-8")
+                        self.lastname = ldap_result[0][0][1]['sn'][0].decode("utf-8")
+                        self.email = ldap_result[0][0][1]['mail'][0].decode("utf-8")
+                    elif LDAP_TYPE == 'ad':
+                        self.firstname = ldap_result[0][0][1]['name'][0].decode("utf-8")
+                        self.email = ldap_result[0][0][1]['userPrincipalName'][0].decode("utf-8")
                 except Exception as e:
-                    logging.info("Reading ldap data threw an exception {0}".format(e))
+                    logging.warning("Reading ldap data threw an exception {0}".format(e))
                     logging.debug(traceback.format_exc())
 
                 # first register user will be in Administrator role
-                self.role_id = Role.query.filter_by(name='User').first().id
                 if User.query.count() == 0:
                     self.role_id = Role.query.filter_by(name='Administrator').first().id
-
-                # user will be in Administrator role if part of LDAP Admin group
-                if LDAP_GROUP_SECURITY:
-                    if isadmin == True:
-                        self.role_id = Role.query.filter_by(name='Administrator').first().id
+                else:
+                    self.role_id = Role.query.filter_by(name=role_name).first().id
 
                 self.create_user()
                 logging.info('Created user "{0}" in the DB'.format(self.username))
 
-            # user already exists in database, set their admin status based on group membership (if enabled)
-            if LDAP_GROUP_SECURITY:
-                self.set_admin(isadmin)
-            self.update_profile()
+            # user already exists in database, set their role based on group membership (if enabled)
+            if LDAP_GROUP_SECURITY_ENABLED:
+                self.set_role(role_name)
+
             return True
         else:
             logging.error('Unsupported authentication method')
@@ -319,9 +317,9 @@ class User(db.Model):
         if User.query.count() == 0:
             self.role_id = Role.query.filter_by(name='Administrator').first().id
 
-        self.password = self.get_hashed_password(self.plain_text_password)
+        self.password = self.get_hashed_password(self.plain_text_password) if self.plain_text_password else '*'
 
-        if self.password:
+        if self.password and self.password != '*':
             self.password = self.password.decode("utf-8")
 
         db.session.add(self)
@@ -435,9 +433,9 @@ class User(db.Model):
             User.query.filter(User.username == self.username).delete()
             db.session.commit()
             return True
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot delete user {0} from DB'.format(self.username))
+            logging.error('Cannot delete user {0} from DB. DETAIL: {1}'.format(self.username, e))
             return False
 
     def revoke_privilege(self):
@@ -452,34 +450,21 @@ class User(db.Model):
                 DomainUser.query.filter(DomainUser.user_id == user_id).delete()
                 db.session.commit()
                 return True
-            except:
+            except Exception as e:
                 db.session.rollback()
-                logging.error('Cannot revoke user {0} privielges'.format(self.username))
+                logging.error('Cannot revoke user {0} privielges. DETAIL: {1}'.format(self.username, e))
                 return False
         return False
 
-    def set_admin(self, is_admin):
-        """
-        Set role for a user:
-            is_admin == True  => Administrator
-            is_admin == False => User
-        """
-        user_role_name = 'Administrator' if is_admin else 'User'
-        role = Role.query.filter(Role.name==user_role_name).first()
-
-        try:
-            if role:
-                user = User.query.filter(User.username==self.username).first()
-                user.role_id = role.id
-                db.session.commit()
-                return True
-            else:
-                return False
-        except:
-            db.session.roleback()
-            logging.error('Cannot change user role in DB')
-            logging.debug(traceback.format_exc())
-            return False
+    def set_role(self, role_name):
+        role = Role.query.filter(Role.name==role_name).first()
+        if role:
+            user = User.query.filter(User.username==self.username).first()
+            user.role_id = role.id
+            db.session.commit()
+            return {'status': True, 'msg': 'Set user role successfully'}
+        else:
+            return {'status': False, 'msg': 'Role does not exist'}
 
 
 class Account(db.Model):
@@ -585,9 +570,9 @@ class Account(db.Model):
             db.session.commit()
             return True
 
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot delete account {0} from DB'.format(self.username))
+            logging.error('Cannot delete account {0} from DB. DETAIL: {1}'.format(self.username, e))
             return False
 
     def get_user(self):
@@ -616,18 +601,18 @@ class Account(db.Model):
             for uid in removed_ids:
                 AccountUser.query.filter(AccountUser.user_id == uid).filter(AccountUser.account_id==account_id).delete()
                 db.session.commit()
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot revoke user privielges on account {0}'.format(self.name))
+            logging.error('Cannot revoke user privielges on account {0}. DETAIL: {1}'.format(self.name, e))
 
         try:
             for uid in added_ids:
                 au = AccountUser(account_id, uid)
                 db.session.add(au)
                 db.session.commit()
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot grant user privileges to account {0}'.format(self.name))
+            logging.error('Cannot grant user privileges to account {0}. DETAIL: {1}'.format(self.name, e))
 
     def revoke_privileges_by_id(self, user_id):
         """
@@ -648,9 +633,9 @@ class Account(db.Model):
             db.session.add(au)
             db.session.commit()
             return True
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot add user privielges on account {0}'.format(self.name))
+            logging.error('Cannot add user privielges on account {0}. DETAIL: {1}'.format(self.name, e))
             return False
 
     def remove_user(self, user):
@@ -661,9 +646,9 @@ class Account(db.Model):
             AccountUser.query.filter(AccountUser.user_id == user.id).filter(AccountUser.account_id == self.id).delete()
             db.session.commit()
             return True
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot revoke user privielges on account {0}'.format(self.name))
+            logging.error('Cannot revoke user privielges on account {0}. DETAIL: {1}'.format(self.name, e))
             return False
 
 
@@ -712,8 +697,8 @@ class DomainSetting(db.Model):
             self.value = value
             db.session.commit()
             return True
-        except:
-            logging.error('Unable to set DomainSetting value')
+        except Exception as e:
+            logging.error('Unable to set DomainSetting value. DETAIL: {0}'.format(e))
             logging.debug(traceback.format_exc())
             db.session.rollback()
             return False
@@ -741,6 +726,16 @@ class Domain(db.Model):
         self.last_check = last_check
         self.dnssec = dnssec
         self.account_id = account_id
+        # PDNS configs
+        self.PDNS_STATS_URL = Setting().get('pdns_api_url')
+        self.PDNS_API_KEY = Setting().get('pdns_api_key')
+        self.PDNS_VERSION = Setting().get('pdns_version')
+        self.API_EXTENDED_URL = utils.pdns_api_extended_uri(self.PDNS_VERSION)
+
+        if StrictVersion(self.PDNS_VERSION) >= StrictVersion('4.0.0'):
+            self.NEW_SCHEMA = True
+        else:
+            self.NEW_SCHEMA = False
 
     def __repr__(self):
         return '<Domain {0}>'.format(self.name)
@@ -759,8 +754,8 @@ class Domain(db.Model):
         Get all domains which has in PowerDNS
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
-        jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers)
+        headers['X-API-Key'] = self.PDNS_API_KEY
+        jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers)
         return jdata
 
     def get_domains(self):
@@ -768,8 +763,8 @@ class Domain(db.Model):
         Get all domains which has in PowerDNS
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
-        jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers)
+        headers['X-API-Key'] = self.PDNS_API_KEY
+        jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers)
         return jdata
 
     def get_id_by_name(self, name):
@@ -779,7 +774,8 @@ class Domain(db.Model):
         try:
             domain = Domain.query.filter(Domain.name==name).first()
             return domain.id
-        except:
+        except Exception as e:
+            logging.error('Domain does not exist. ERROR: {0}'.format(e))
             return None
 
     def update(self):
@@ -791,9 +787,9 @@ class Domain(db.Model):
         dict_db_domain = dict((x.name,x) for x in db_domain)
 
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers)
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers)
             list_jdomain = [d['name'].rstrip('.') for d in jdata]
             try:
                 # domains should remove from db since it doesn't exist in powerdns anymore
@@ -813,8 +809,8 @@ class Domain(db.Model):
                     # then remove domain
                     Domain.query.filter(Domain.name == d).delete()
                     db.session.commit()
-            except:
-                logging.error('Can not delete domain from DB')
+            except Exception as e:
+                logging.error('Can not delete domain from DB. DETAIL: {0}'.format(e))
                 logging.debug(traceback.format_exc())
                 db.session.rollback()
 
@@ -874,9 +870,9 @@ class Domain(db.Model):
         Add a domain to power dns
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
-        if NEW_SCHEMA:
+        if self.NEW_SCHEMA:
             domain_name = domain_name + '.'
             domain_ns = [ns + '.' for ns in domain_ns]
 
@@ -896,7 +892,7 @@ class Domain(db.Model):
         }
 
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers, method='POST', data=post_data)
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones'), headers=headers, method='POST', data=post_data)
             if 'error' in jdata.keys():
                 logging.error(jdata['error'])
                 return {'status': 'error', 'msg': jdata['error']}
@@ -906,7 +902,7 @@ class Domain(db.Model):
                 return {'status': 'ok', 'msg': 'Added domain successfully'}
         except Exception as e:
             logging.error('Cannot add domain {0}'.format(domain_name))
-            logging.debug(traceback.print_exc())
+            logging.debug(traceback.format_exc())
             return {'status': 'error', 'msg': 'Cannot add this domain.'}
 
     def update_soa_setting(self, domain_name, soa_edit_api):
@@ -914,7 +910,7 @@ class Domain(db.Model):
         if not domain:
             return {'status': 'error', 'msg': 'Domain doesnt exist.'}
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
         if soa_edit_api not in ["DEFAULT", "INCREASE", "EPOCH", "OFF"]:
             soa_edit_api = 'DEFAULT'
@@ -929,7 +925,7 @@ class Domain(db.Model):
 
         try:
             jdata = utils.fetch_json(
-            urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers,
+            urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers,
             method='PUT', data=post_data)
             if 'error' in jdata.keys():
                 logging.error(jdata['error'])
@@ -951,7 +947,7 @@ class Domain(db.Model):
         domain_obj = Domain.query.filter(Domain.name == domain_name).first()
         domain_auto_ptr = DomainSetting.query.filter(DomainSetting.domain == domain_obj).filter(DomainSetting.setting == 'auto_ptr').first()
         domain_auto_ptr = strtobool(domain_auto_ptr.value) if domain_auto_ptr else False
-        system_auto_ptr = strtobool(Setting().get('auto_ptr'))
+        system_auto_ptr = Setting().get('auto_ptr')
         self.name = domain_name
         domain_id = self.get_id_by_name(domain_reverse_name)
         if None == domain_id and \
@@ -975,7 +971,7 @@ class Domain(db.Model):
                 domain_users.append(tmp.username)
             if 0 != len(domain_users):
                 self.name = domain_reverse_name
-                self.grant_privielges(domain_users)
+                self.grant_privileges(domain_users)
                 return {'status': 'ok', 'msg': 'New reverse lookup domain created with granted privilages'}
             return {'status': 'ok', 'msg': 'New reverse lookup domain created without users'}
         return {'status': 'ok', 'msg': 'Reverse lookup domain already exists'}
@@ -1002,14 +998,14 @@ class Domain(db.Model):
         Delete a single domain name from powerdns
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers, method='DELETE')
+            utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers, method='DELETE')
             logging.info('Delete domain {0} successfully'.format(domain_name))
             return {'status': 'ok', 'msg': 'Delete domain successfully'}
         except Exception as e:
             logging.error('Cannot delete domain {0}'.format(domain_name))
-            logging.debug(traceback.print_exc())
+            logging.debug(traceback.format_exc())
             return {'status': 'error', 'msg': 'Cannot delete domain'}
 
     def get_user(self):
@@ -1022,7 +1018,7 @@ class Domain(db.Model):
             user_ids.append(q[0].user_id)
         return user_ids
 
-    def grant_privielges(self, new_user_list):
+    def grant_privileges(self, new_user_list):
         """
         Reconfigure domain_user table
         """
@@ -1039,18 +1035,18 @@ class Domain(db.Model):
             for uid in removed_ids:
                 DomainUser.query.filter(DomainUser.user_id == uid).filter(DomainUser.domain_id==domain_id).delete()
                 db.session.commit()
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot revoke user privielges on domain {0}'.format(self.name))
+            logging.error('Cannot revoke user privielges on domain {0}. DETAIL: {1}'.format(self.name, e))
 
         try:
             for uid in added_ids:
                 du = DomainUser(domain_id, uid)
                 db.session.add(du)
                 db.session.commit()
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error('Cannot grant user privielges to domain {0}'.format(self.name))
+            logging.error('Cannot grant user privielges to domain {0}. DETAIL: {1}'.format(self.name, e))
 
     def update_from_master(self, domain_name):
         """
@@ -1059,11 +1055,12 @@ class Domain(db.Model):
         domain = Domain.query.filter(Domain.name == domain_name).first()
         if domain:
             headers = {}
-            headers['X-API-Key'] = PDNS_API_KEY
+            headers['X-API-Key'] = self.PDNS_API_KEY
             try:
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}/axfr-retrieve'.format(domain.name)), headers=headers, method='PUT')
+                utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}/axfr-retrieve'.format(domain.name)), headers=headers, method='PUT')
                 return {'status': 'ok', 'msg': 'Update from Master successfully'}
-            except:
+            except Exception as e:
+                logging.error('Cannot update from master. DETAIL: {0}'.format(e))
                 return {'status': 'error', 'msg': 'There was something wrong, please contact administrator'}
         else:
             return {'status': 'error', 'msg': 'This domain doesnot exist'}
@@ -1075,14 +1072,15 @@ class Domain(db.Model):
         domain = Domain.query.filter(Domain.name == domain_name).first()
         if domain:
             headers = {}
-            headers['X-API-Key'] = PDNS_API_KEY
+            headers['X-API-Key'] = self.PDNS_API_KEY
             try:
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys'.format(domain.name)), headers=headers, method='GET')
+                jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys'.format(domain.name)), headers=headers, method='GET')
                 if 'error' in jdata:
                     return {'status': 'error', 'msg': 'DNSSEC is not enabled for this domain'}
                 else:
                     return {'status': 'ok', 'dnssec': jdata}
-            except:
+            except Exception as e:
+                logging.error('Cannot get domain dnssec. DETAIL: {0}'.format(e))
                 return {'status': 'error', 'msg': 'There was something wrong, please contact administrator'}
         else:
             return {'status': 'error', 'msg': 'This domain doesnot exist'}
@@ -1094,13 +1092,13 @@ class Domain(db.Model):
         domain = Domain.query.filter(Domain.name == domain_name).first()
         if domain:
             headers = {}
-            headers['X-API-Key'] = PDNS_API_KEY
+            headers['X-API-Key'] = self.PDNS_API_KEY
             try:
                 # Enable API-RECTIFY for domain, BEFORE activating DNSSEC
                 post_data = {
                     "api_rectify": True
                 }
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers, method='PUT', data=post_data)
+                jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers, method='PUT', data=post_data)
                 if 'error' in jdata:
                     return {'status': 'error', 'msg': 'API-RECTIFY could not be enabled for this domain', 'jdata' : jdata}
 
@@ -1109,14 +1107,15 @@ class Domain(db.Model):
                     "keytype": "ksk",
                     "active": True
                 }
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys'.format(domain.name)), headers=headers, method='POST',data=post_data)
+                jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys'.format(domain.name)), headers=headers, method='POST',data=post_data)
                 if 'error' in jdata:
                     return {'status': 'error', 'msg': 'Cannot enable DNSSEC for this domain. Error: {0}'.format(jdata['error']), 'jdata' : jdata}
 
                 return {'status': 'ok'}
 
-            except:
-                logging.error(traceback.print_exc())
+            except Exception as e:
+                logging.error('Cannot enable dns sec. DETAIL: {}'.format(e))
+                logging.debug(traceback.format_exc())
                 return {'status': 'error', 'msg': 'There was something wrong, please contact administrator'}
 
         else:
@@ -1129,10 +1128,10 @@ class Domain(db.Model):
         domain = Domain.query.filter(Domain.name == domain_name).first()
         if domain:
             headers = {}
-            headers['X-API-Key'] = PDNS_API_KEY
+            headers['X-API-Key'] = self.PDNS_API_KEY
             try:
                 # Deactivate DNSSEC
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys/{1}'.format(domain.name, key_id)), headers=headers, method='DELETE')
+                jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}/cryptokeys/{1}'.format(domain.name, key_id)), headers=headers, method='DELETE')
                 if jdata != True:
                     return {'status': 'error', 'msg': 'Cannot disable DNSSEC for this domain. Error: {0}'.format(jdata['error']), 'jdata' : jdata}
 
@@ -1140,14 +1139,15 @@ class Domain(db.Model):
                 post_data = {
                     "api_rectify": False
                 }
-                jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers, method='PUT', data=post_data)
+                jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain.name)), headers=headers, method='PUT', data=post_data)
                 if 'error' in jdata:
                     return {'status': 'error', 'msg': 'API-RECTIFY could not be disabled for this domain', 'jdata' : jdata}
 
                 return {'status': 'ok'}
 
-            except:
-                logging.error(traceback.print_exc())
+            except Exception as e:
+                logging.error('Cannot delete dnssec key. DETAIL: {0}'.format(e))
+                logging.debug(traceback.format_exc())
                 return {'status': 'error', 'msg': 'There was something wrong, please contact administrator','domain': domain.name, 'id': key_id}
 
         else:
@@ -1169,7 +1169,7 @@ class Domain(db.Model):
             return {'status': False, 'msg': 'Domain does not exist'}
 
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
         account_name = Account().get_name_by_id(account_id)
 
@@ -1179,16 +1179,15 @@ class Domain(db.Model):
 
         try:
             jdata = utils.fetch_json(
-            urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers,
+            urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain_name)), headers=headers,
             method='PUT', data=post_data)
 
             if 'error' in jdata.keys():
                 logging.error(jdata['error'])
                 return {'status': 'error', 'msg': jdata['error']}
-
             else:
                 self.update()
-                logging.info('account changed for domain {0} successfully'.format(domain_name))
+                logging.info('Account changed for domain {0} successfully'.format(domain_name))
                 return {'status': 'ok', 'msg': 'account changed successfully'}
 
         except Exception as e:
@@ -1196,8 +1195,6 @@ class Domain(db.Model):
             logging.debug(traceback.format_exc())
             logging.error('Cannot change account for domain {0}'.format(domain_name))
             return {'status': 'error', 'msg': 'Cannot change account for this domain.'}
-
-        return {'status': True, 'msg': 'Domain association successful'}
 
     def get_account(self):
         """
@@ -1248,24 +1245,35 @@ class Record(object):
         self.status = status
         self.ttl = ttl
         self.data = data
+        # PDNS configs
+        self.PDNS_STATS_URL = Setting().get('pdns_api_url')
+        self.PDNS_API_KEY = Setting().get('pdns_api_key')
+        self.PDNS_VERSION = Setting().get('pdns_version')
+        self.API_EXTENDED_URL = utils.pdns_api_extended_uri(self.PDNS_VERSION)
+        self.PRETTY_IPV6_PTR = Setting().get('pretty_ipv6_ptr')
+
+        if StrictVersion(self.PDNS_VERSION) >= StrictVersion('4.0.0'):
+            self.NEW_SCHEMA = True
+        else:
+            self.NEW_SCHEMA = False
 
     def get_record_data(self, domain):
         """
         Query domain's DNS records via API
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers)
-        except:
-            logging.error("Cannot fetch domain's record data from remote powerdns api")
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers)
+        except Exception as e:
+            logging.error("Cannot fetch domain's record data from remote powerdns api. DETAIL: {0}".format(e))
             return False
 
-        if NEW_SCHEMA:
+        if self.NEW_SCHEMA:
             rrsets = jdata['rrsets']
             for rrset in rrsets:
                 r_name = rrset['name'].rstrip('.')
-                if PRETTY_IPV6_PTR: # only if activated
+                if self.PRETTY_IPV6_PTR: # only if activated
                     if rrset['type'] == 'PTR': # only ptr
                         if 'ip6.arpa' in r_name: # only if v6-ptr
                             r_name = dns.reversename.to_address(dns.name.from_text(r_name))
@@ -1292,9 +1300,9 @@ class Record(object):
 
         # continue if the record is ready to be added
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
-        if NEW_SCHEMA:
+        if self.NEW_SCHEMA:
             data = {"rrsets": [
                         {
                             "name": self.name.rstrip('.') + '.',
@@ -1330,7 +1338,7 @@ class Record(object):
                 }
 
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
             logging.debug(jdata)
             return {'status': 'ok', 'msg': 'Record was added successfully'}
         except Exception as e:
@@ -1356,7 +1364,7 @@ class Record(object):
         list_deleted_records = [x for x in list_current_records if x not in list_new_records]
 
         # convert back to list of hash
-        deleted_records = [x for x in current_records if [x['name'],x['type']] in list_deleted_records and (x['type'] in app.config['RECORDS_ALLOW_EDIT'] and x['type'] != 'SOA')]
+        deleted_records = [x for x in current_records if [x['name'],x['type']] in list_deleted_records and (x['type'] in Setting().get_records_allow_to_edit() and x['type'] != 'SOA')]
 
         # return a tuple
         return deleted_records, new_records
@@ -1370,16 +1378,18 @@ class Record(object):
         for r in post_records:
             r_name = domain if r['record_name'] in ['@', ''] else r['record_name'] + '.' + domain
             r_type = r['record_type']
-            if PRETTY_IPV6_PTR: # only if activated
-                if NEW_SCHEMA: # only if new schema
+            if self.PRETTY_IPV6_PTR: # only if activated
+                if self.NEW_SCHEMA: # only if new schema
                     if r_type == 'PTR': # only ptr
                         if ':' in r['record_name']: # dirty ipv6 check
                             r_name = r['record_name']
 
+            r_data = domain if r_type == 'CNAME' and r['record_data'] in ['@', ''] else r['record_data']
+            
             record = {
                         "name": r_name,
                         "type": r_type,
-                        "content": r['record_data'],
+                        "content": r_data,
                         "disabled": True if r['record_status'] == 'Disabled' else False,
                         "ttl": int(r['record_ttl']) if r['record_ttl'] else 3600,
                     }
@@ -1389,10 +1399,10 @@ class Record(object):
 
         records = []
         for r in deleted_records:
-            r_name = r['name'].rstrip('.') + '.' if NEW_SCHEMA else r['name']
+            r_name = r['name'].rstrip('.') + '.' if self.NEW_SCHEMA else r['name']
             r_type = r['type']
-            if PRETTY_IPV6_PTR: # only if activated
-                if NEW_SCHEMA: # only if new schema
+            if self.PRETTY_IPV6_PTR: # only if activated
+                if self.NEW_SCHEMA: # only if new schema
                     if r_type == 'PTR': # only ptr
                         if ':' in r['name']: # dirty ipv6 check
                             r_name = dns.reversename.from_address(r['name']).to_text()
@@ -1410,10 +1420,10 @@ class Record(object):
 
         records = []
         for r in new_records:
-            if NEW_SCHEMA:
+            if self.NEW_SCHEMA:
                 r_name = r['name'].rstrip('.') + '.'
                 r_type = r['type']
-                if PRETTY_IPV6_PTR: # only if activated
+                if self.PRETTY_IPV6_PTR: # only if activated
                     if r_type == 'PTR': # only ptr
                         if ':' in r['name']: # dirty ipv6 check
                             r_name = r['name']
@@ -1453,12 +1463,12 @@ class Record(object):
         final_records = []
         records = sorted(records, key = lambda item: (item["name"], item["type"], item["changetype"]))
         for key, group in itertools.groupby(records, lambda item: (item["name"], item["type"], item["changetype"])):
-            if NEW_SCHEMA:
+            if self.NEW_SCHEMA:
                 r_name = key[0]
                 r_type = key[1]
                 r_changetype = key[2]
 
-                if PRETTY_IPV6_PTR: # only if activated
+                if self.PRETTY_IPV6_PTR: # only if activated
                     if r_type == 'PTR': # only ptr
                         if ':' in r_name: # dirty ipv6 check
                             r_name = dns.reversename.from_address(r_name).to_text()
@@ -1504,16 +1514,20 @@ class Record(object):
                     })
 
         postdata_for_new = {"rrsets": final_records}
-        logging.info(postdata_for_new)
-        logging.info(postdata_for_delete)
-        logging.info(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)))
+        logging.debug(postdata_for_new)
+        logging.debug(postdata_for_delete)
+        logging.info(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)))
         try:
             headers = {}
-            headers['X-API-Key'] = PDNS_API_KEY
-            jdata1 = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=postdata_for_delete)
-            jdata2 = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=postdata_for_new)
+            headers['X-API-Key'] = self.PDNS_API_KEY
+            jdata1 = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=postdata_for_delete)
+            jdata2 = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=postdata_for_new)
 
-            if 'error' in jdata2.keys():
+            if 'error' in jdata1.keys():
+                logging.error('Cannot apply record changes.')
+                logging.debug(jdata1['error'])
+                return {'status': 'error', 'msg': jdata1['error']}
+            elif 'error' in jdata2.keys():
                 logging.error('Cannot apply record changes.')
                 logging.debug(jdata2['error'])
                 return {'status': 'error', 'msg': jdata2['error']}
@@ -1523,7 +1537,8 @@ class Record(object):
                 logging.info('Record was applied successfully.')
                 return {'status': 'ok', 'msg': 'Record was applied successfully'}
         except Exception as e:
-            logging.error("Cannot apply record changes to domain {0}. DETAIL: {1}".format(e, domain))
+            logging.error("Cannot apply record changes to domain {0}. Error: {1}".format(domain, e))
+            logging.debug(traceback.format_exc())
             return {'status': 'error', 'msg': 'There was something wrong, please contact administrator'}
 
     def auto_ptr(self, domain, new_records, deleted_records):
@@ -1534,7 +1549,7 @@ class Record(object):
         domain_auto_ptr = DomainSetting.query.filter(DomainSetting.domain == domain_obj).filter(DomainSetting.setting == 'auto_ptr').first()
         domain_auto_ptr = strtobool(domain_auto_ptr.value) if domain_auto_ptr else False
 
-        system_auto_ptr = strtobool(Setting().get('auto_ptr'))
+        system_auto_ptr = Setting().get('auto_ptr')
 
         if system_auto_ptr or domain_auto_ptr:
             try:
@@ -1554,7 +1569,6 @@ class Record(object):
                         self.add(domain_reverse_name)
                 for r in deleted_records:
                     if r['type'] in ['A', 'AAAA']:
-                        r_name = r['name'] + '.'
                         r_content = r['content']
                         reverse_host_address = dns.reversename.from_address(r_content).to_text()
                         domain_reverse_name = d.get_reverse_domain_name(reverse_host_address)
@@ -1572,7 +1586,7 @@ class Record(object):
         Delete a record from domain
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
         data = {"rrsets": [
                     {
                         "name": self.name.rstrip('.') + '.',
@@ -1584,24 +1598,24 @@ class Record(object):
                 ]
             }
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
             logging.debug(jdata)
             return {'status': 'ok', 'msg': 'Record was removed successfully'}
-        except:
-            logging.error("Cannot remove record {0}/{1}/{2} from domain {3}".format(self.name, self.type, self.data, domain))
+        except Exception as e:
+            logging.error("Cannot remove record {0}/{1}/{2} from domain {3}. DETAIL: {4}".format(self.name, self.type, self.data, domain, e))
             return {'status': 'error', 'msg': 'There was something wrong, please contact administrator'}
 
     def is_allowed_edit(self):
         """
         Check if record is allowed to edit
         """
-        return self.type in app.config['RECORDS_ALLOW_EDIT']
+        return self.type in Setting().get_records_allow_to_edit()
 
     def is_allowed_delete(self):
         """
         Check if record is allowed to removed
         """
-        return (self.type in app.config['RECORDS_ALLOW_EDIT'] and self.type != 'SOA')
+        return (self.type in Setting().get_records_allow_to_edit() and self.type != 'SOA')
 
     def exists(self, domain):
         """
@@ -1626,9 +1640,9 @@ class Record(object):
         Update single record
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
-        if NEW_SCHEMA:
+        if self.NEW_SCHEMA:
             data = {"rrsets": [
                         {
                             "name": self.name + '.',
@@ -1664,7 +1678,7 @@ class Record(object):
                     ]
                 }
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
+            utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='PATCH', data=data)
             logging.debug("dyndns data: {0}".format(data))
             return {'status': 'ok', 'msg': 'Record was updated successfully'}
         except Exception as e:
@@ -1673,8 +1687,8 @@ class Record(object):
 
     def update_db_serial(self, domain):
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
-        jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='GET')
+        headers['X-API-Key'] = self.PDNS_API_KEY
+        jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/localhost/zones/{0}'.format(domain)), headers=headers, method='GET')
         serial = jdata['serial']
 
         domain = Domain.query.filter(Domain.name==domain).first()
@@ -1695,19 +1709,24 @@ class Server(object):
     def __init__(self, server_id=None, server_config=None):
         self.server_id = server_id
         self.server_config = server_config
+        # PDNS configs
+        self.PDNS_STATS_URL = Setting().get('pdns_api_url')
+        self.PDNS_API_KEY = Setting().get('pdns_api_key')
+        self.PDNS_VERSION = Setting().get('pdns_version')
+        self.API_EXTENDED_URL = utils.pdns_api_extended_uri(self.PDNS_VERSION)
 
     def get_config(self):
         """
         Get server config
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/{0}/config'.format(self.server_id)), headers=headers, method='GET')
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/{0}/config'.format(self.server_id)), headers=headers, method='GET')
             return jdata
-        except:
-            logging.error("Can not get server configuration.")
+        except Exception as e:
+            logging.error("Can not get server configuration. DETAIL: {0}".format(e))
             logging.debug(traceback.format_exc())
             return []
 
@@ -1716,13 +1735,13 @@ class Server(object):
         Get server statistics
         """
         headers = {}
-        headers['X-API-Key'] = PDNS_API_KEY
+        headers['X-API-Key'] = self.PDNS_API_KEY
 
         try:
-            jdata = utils.fetch_json(urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/{0}/statistics'.format(self.server_id)), headers=headers, method='GET')
+            jdata = utils.fetch_json(urljoin(self.PDNS_STATS_URL, self.API_EXTENDED_URL + '/servers/{0}/statistics'.format(self.server_id)), headers=headers, method='GET')
             return jdata
-        except:
-            logging.error("Can not get server statistics.")
+        except Exception as e:
+            logging.error("Can not get server statistics. DETAIL: {0}".format(e))
             logging.debug(traceback.format_exc())
             return []
 
@@ -1760,32 +1779,68 @@ class History(db.Model):
         Remove all history from DB
         """
         try:
-            num_rows_deleted = db.session.query(History).delete()
+            db.session.query(History).delete()
             db.session.commit()
             logging.info("Removed all history")
             return True
-        except:
+        except Exception as e:
             db.session.rollback()
-            logging.error("Cannot remove history")
+            logging.error("Cannot remove history. DETAIL: {0}".format(e))
             logging.debug(traceback.format_exc())
             return False
 
 class Setting(db.Model):
     id = db.Column(db.Integer, primary_key = True)
     name = db.Column(db.String(64))
-    value = db.Column(db.String(256))
+    value = db.Column(db.Text())
 
-    # default settings (serves as list of known settings too):
-    # Note: booleans must be strings because of the way they are stored and used
     defaults = {
-        'maintenance': 'False',
-        'fullscreen_layout': 'True',
-        'record_helper': 'True',
-        'login_ldap_first': 'True',
+        'maintenance': False,
+        'fullscreen_layout': True,
+        'record_helper': True,
+        'login_ldap_first': True,
         'default_record_table_size': 15,
         'default_domain_table_size': 10,
-        'auto_ptr': 'False',
-        'allow_quick_edit': 'True'
+        'auto_ptr': False,
+        'record_quick_edit': True,
+        'pretty_ipv6_ptr': False,
+        'dnssec_admins_only': False,
+        'allow_user_create_domain': False,
+        'bg_domain_updates': False,
+        'site_name': 'PowerDNS-Admin',
+        'pdns_api_url': '',
+        'pdns_api_key': '',
+        'pdns_version': '4.1.1',
+        'local_db_enabled': True,
+        'signup_enabled': True,
+        'ldap_enabled': False,
+        'ldap_type': 'ldap',
+        'ldap_uri': '',
+        'ldap_base_dn': '',
+        'ldap_admin_username': '',
+        'ldap_admin_password': '',
+        'ldap_filter_basic': '',
+        'ldap_filter_username': '',
+        'ldap_sg_enabled': False,
+        'ldap_admin_group': '',
+        'ldap_operator_group': '',
+        'ldap_user_group': '',
+        'github_oauth_enabled': False,
+        'github_oauth_key': '',
+        'github_oauth_secret': '',
+        'github_oauth_scope': 'email',
+        'github_oauth_api_url': 'https://api.github.com/user',
+        'github_oauth_token_url': 'https://github.com/login/oauth/access_token',
+        'github_oauth_authorize_url': 'https://github.com/login/oauth/authorize',
+        'google_oauth_enabled': False,
+        'google_oauth_client_id':'',
+        'google_oauth_client_secret':'',
+        'google_token_url': 'https://accounts.google.com/o/oauth2/token',
+        'google_token_params': {'scope': 'email profile'},
+        'google_authorize_url':'https://accounts.google.com/o/oauth2/auth',
+        'google_base_url':'https://www.googleapis.com/oauth2/v1/',
+        'forward_records_allow_edit': {'A': True, 'AAAA': True, 'AFSDB': False, 'ALIAS': False, 'CAA': True, 'CERT': False, 'CDNSKEY': False, 'CDS': False, 'CNAME': True, 'DNSKEY': False, 'DNAME': False, 'DS': False, 'HINFO': False, 'KEY': False, 'LOC': True, 'MX': True, 'NAPTR': False, 'NS': True, 'NSEC': False, 'NSEC3': False, 'NSEC3PARAM': False, 'OPENPGPKEY': False, 'PTR': True, 'RP': False, 'RRSIG': False, 'SOA': False, 'SPF': True, 'SSHFP': False, 'SRV': True, 'TKEY': False, 'TSIG': False, 'TLSA': False, 'SMIMEA': False, 'TXT': True, 'URI': False},
+        'reverse_records_allow_edit': {'A': False, 'AAAA': False, 'AFSDB': False, 'ALIAS': False, 'CAA': False, 'CERT': False, 'CDNSKEY': False, 'CDS': False, 'CNAME': False, 'DNSKEY': False, 'DNAME': False, 'DS': False, 'HINFO': False, 'KEY': False, 'LOC': True, 'MX': False, 'NAPTR': False, 'NS': True, 'NSEC': False, 'NSEC3': False, 'NSEC3PARAM': False, 'OPENPGPKEY': False, 'PTR': True, 'RP': False, 'RRSIG': False, 'SOA': False, 'SPF': False, 'SSHFP': False, 'SRV': False, 'TKEY': False, 'TSIG': False, 'TLSA': False, 'SMIMEA': False, 'TXT': True, 'URI': False},
     }
 
     def __init__(self, id=None, name=None, value=None):
@@ -1804,7 +1859,7 @@ class Setting(db.Model):
 
         if maintenance is None:
             value = self.defaults['maintenance']
-            maintenance = Setting(name='maintenance', value=value)
+            maintenance = Setting(name='maintenance', value=str(value))
             db.session.add(maintenance)
 
         mode = str(mode)
@@ -1814,8 +1869,8 @@ class Setting(db.Model):
                 maintenance.value = mode
                 db.session.commit()
             return True
-        except:
-            logging.error('Cannot set maintenance to {0}'.format(mode))
+        except Exception as e:
+            logging.error('Cannot set maintenance to {0}. DETAIL: {1}'.format(mode, e))
             logging.debug(traceback.format_exec())
             db.session.rollback()
             return False
@@ -1825,7 +1880,7 @@ class Setting(db.Model):
 
         if current_setting is None:
             value = self.defaults[setting]
-            current_setting = Setting(name=setting, value=value)
+            current_setting = Setting(name=setting, value=str(value))
             db.session.add(current_setting)
 
         try:
@@ -1835,8 +1890,8 @@ class Setting(db.Model):
                 current_setting.value = "True"
             db.session.commit()
             return True
-        except:
-            logging.error('Cannot toggle setting {0}'.format(setting))
+        except Exception as e:
+            logging.error('Cannot toggle setting {0}. DETAIL: {1}'.format(setting, e))
             logging.debug(traceback.format_exec())
             db.session.rollback()
             return False
@@ -1854,8 +1909,8 @@ class Setting(db.Model):
             current_setting.value = value
             db.session.commit()
             return True
-        except:
-            logging.error('Cannot edit setting {0}'.format(setting))
+        except Exception as e:
+            logging.error('Cannot edit setting {0}. DETAIL: {1}'.format(setting, e))
             logging.debug(traceback.format_exec())
             db.session.rollback()
             return False
@@ -1864,11 +1919,32 @@ class Setting(db.Model):
         if setting in self.defaults:
             result = self.query.filter(Setting.name == setting).first()
             if result is not None:
-                return result.value
+                return strtobool(result.value) if result.value in ['True', 'False'] else result.value
             else:
                 return self.defaults[setting]
         else:
             logging.error('Unknown setting queried: {0}'.format(setting))
+
+    def get_records_allow_to_edit(self):
+        return list(set(self.get_forward_records_allow_to_edit() + self.get_reverse_records_allow_to_edit()))
+
+    def get_forward_records_allow_to_edit(self):
+        records = self.get('forward_records_allow_edit')
+        f_records = literal_eval(records) if isinstance(records, str) else records
+        r_name = [r for r in f_records if f_records[r]]
+        # Sort alphabetically if python version is smaller than 3.6
+        if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 6):
+            r_name.sort()
+        return r_name
+
+    def get_reverse_records_allow_to_edit(self):
+        records = self.get('reverse_records_allow_edit')
+        r_records = literal_eval(records) if isinstance(records, str) else records
+        r_name = [r for r in r_records if r_records[r]]
+        # Sort alphabetically if python version is smaller than 3.6
+        if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 6):
+            r_name.sort()
+        return r_name
 
 
 class DomainTemplate(db.Model):

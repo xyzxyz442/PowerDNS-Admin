@@ -1,5 +1,4 @@
 import base64
-import json
 import logging as logger
 import os
 import traceback
@@ -8,88 +7,66 @@ from distutils.util import strtobool
 from distutils.version import StrictVersion
 from functools import wraps
 from io import BytesIO
+from ast import literal_eval
 
-import jinja2
 import qrcode as qrc
 import qrcode.image.svg as qrc_svg
 from flask import g, request, make_response, jsonify, render_template, session, redirect, url_for, send_from_directory, abort, flash
 from flask_login import login_user, logout_user, current_user, login_required
 from werkzeug import secure_filename
-from werkzeug.security import gen_salt
 
 from .models import User, Account, Domain, Record, Role, Server, History, Anonymous, Setting, DomainSetting, DomainTemplate, DomainTemplateRecord
-from app import app, login_manager, github, google
+from app import app, login_manager
 from app.lib import utils
-from app.decorators import admin_role_required, can_access_domain, can_configure_dnssec
+from app.oauth import github_oauth, google_oauth
+from app.decorators import admin_role_required, operator_role_required, can_access_domain, can_configure_dnssec, can_create_domain
 
 if app.config['SAML_ENABLED']:
-    from onelogin.saml2.auth import OneLogin_Saml2_Auth
     from onelogin.saml2.utils import OneLogin_Saml2_Utils
 
+google = None
+github = None
 logging = logger.getLogger(__name__)
+
 
 # FILTERS
 app.jinja_env.filters['display_record_name'] = utils.display_record_name
 app.jinja_env.filters['display_master_name'] = utils.display_master_name
 app.jinja_env.filters['display_second_to_time'] = utils.display_time
 app.jinja_env.filters['email_to_gravatar_url'] = utils.email_to_gravatar_url
-
-# Flag for pdns v4.x.x
-# TODO: Find another way to do this
-PDNS_VERSION = app.config['PDNS_VERSION']
-if StrictVersion(PDNS_VERSION) >= StrictVersion('4.0.0'):
-    NEW_SCHEMA = True
-else:
-    NEW_SCHEMA = False
+app.jinja_env.filters['display_setting_state'] = utils.display_setting_state
 
 
 @app.context_processor
-def inject_fullscreen_layout_setting():
-    setting_value = Setting().get('fullscreen_layout')
-    return dict(fullscreen_layout_setting=strtobool(setting_value))
-
-
-@app.context_processor
-def inject_record_helper_setting():
-    setting_value = Setting().get('record_helper')
-    return dict(record_helper_setting=strtobool(setting_value))
-
+def inject_sitename():
+    setting = Setting().get('site_name')
+    return dict(SITE_NAME=setting)
 
 @app.context_processor
-def inject_login_ldap_first_setting():
-    setting_value = Setting().get('login_ldap_first')
-    return dict(login_ldap_first_setting=strtobool(setting_value))
+def inject_setting():
+    setting = Setting()
+    return dict(SETTING=setting)
 
 
-@app.context_processor
-def inject_default_record_table_size_setting():
-    setting_value = Setting().get('default_record_table_size')
-    return dict(default_record_table_size_setting=setting_value)
-
-
-@app.context_processor
-def inject_default_domain_table_size_setting():
-    setting_value = Setting().get('default_domain_table_size')
-    return dict(default_domain_table_size_setting=setting_value)
-
-
-@app.context_processor
-def inject_auto_ptr_setting():
-    setting_value = Setting().get('auto_ptr')
-    return dict(auto_ptr_setting=strtobool(setting_value))
+@app.before_first_request
+def register_modules():
+    global google
+    global github
+    google = google_oauth()
+    github = github_oauth()
 
 
 # START USER AUTHENTICATION HANDLER
 @app.before_request
 def before_request():
-    # check site maintenance mode first
-    maintenance = Setting().get('maintenance')
-    if strtobool(maintenance):
-        return render_template('maintenance.html')
-
     # check if user is anonymous
     g.user = current_user
     login_manager.anonymous_user = Anonymous
+
+    # check site maintenance mode
+    maintenance = Setting().get('maintenance')
+    if maintenance and current_user.is_authenticated and current_user.role.name not in ['Administrator', 'Operator']:
+        return render_template('maintenance.html')
 
 
 @login_manager.user_loader
@@ -126,7 +103,8 @@ def login_via_authorization_header(request):
             else:
                 login_user(user, remember = False)
                 return user
-        except:
+        except Exception as e:
+            logging.error('Error: {0}'.format(e))
             return None
     return None
 # END USER AUTHENTICATION HANDLER
@@ -164,8 +142,7 @@ def error(code, msg=None):
 
 @app.route('/register', methods=['GET'])
 def register():
-    SIGNUP_ENABLED = app.config['SIGNUP_ENABLED']
-    if SIGNUP_ENABLED:
+    if Setting().get('signup_enabled'):
         return render_template('register.html')
     else:
         return render_template('errors/404.html'), 404
@@ -173,16 +150,21 @@ def register():
 
 @app.route('/google/login')
 def google_login():
-    if not app.config.get('GOOGLE_OAUTH_ENABLE'):
+    if not Setting().get('google_oauth_enabled') or google is None:
+        logging.error('Google OAuth is disabled or you have not yet reloaded the pda application after enabling.')
         return abort(400)
-    return google.authorize(callback=url_for('authorized', _external=True))
+    else:
+        return google.authorize(callback=url_for('google_authorized', _external=True))
 
 
 @app.route('/github/login')
 def github_login():
-    if not app.config.get('GITHUB_OAUTH_ENABLE'):
+    if not Setting().get('github_oauth_enabled') or github is None:
+        logging.error('Github OAuth is disabled or you have not yet reloaded the pda application after enabling.')
         return abort(400)
-    return github.authorize(callback=url_for('authorized', _external=True))
+    else:
+        return github.authorize(callback=url_for('github_authorized', _external=True))
+
 
 @app.route('/saml/login')
 def saml_login():
@@ -192,6 +174,7 @@ def saml_login():
     auth = utils.init_saml_auth(req)
     redirect_url=OneLogin_Saml2_Utils.get_self_url(req) + url_for('saml_authorized')
     return redirect(auth.login(return_to=redirect_url))
+
 
 @app.route('/saml/metadata')
 def saml_metadata():
@@ -209,6 +192,7 @@ def saml_metadata():
     else:
         resp = make_response(errors.join(', '), 500)
     return resp
+
 
 @app.route('/saml/authorized', methods=['GET', 'POST'])
 def saml_authorized():
@@ -288,21 +272,16 @@ def saml_authorized():
                 history.add()
         user.plain_text_password = None
         user.update_profile()
-        session['external_auth'] = True
+        session['authentication_type'] = 'SAML'
         login_user(user, remember=False)
         return redirect(url_for('index'))
     else:
         return  render_template('errors/SAML.html', errors=errors)
 
+
 @app.route('/login', methods=['GET', 'POST'])
 @login_manager.unauthorized_handler
 def login():
-    LOGIN_TITLE = app.config['LOGIN_TITLE'] if 'LOGIN_TITLE' in app.config.keys() else ''
-    BASIC_ENABLED = app.config['BASIC_ENABLED']
-    SIGNUP_ENABLED = app.config['SIGNUP_ENABLED']
-    LDAP_ENABLED = app.config.get('LDAP_ENABLED')
-    GITHUB_ENABLE = app.config.get('GITHUB_OAUTH_ENABLE')
-    GOOGLE_ENABLE = app.config.get('GOOGLE_OAUTH_ENABLE')
     SAML_ENABLED = app.config.get('SAML_ENABLED')
 
     if g.user is not None and current_user.is_authenticated:
@@ -315,7 +294,6 @@ def login():
         email = user_data['email']
         user = User.query.filter_by(username=email).first()
         if not user:
-            # create user
             user = User(username=email,
                         firstname=first_name,
                         lastname=surname,
@@ -329,18 +307,23 @@ def login():
 
         session['user_id'] = user.id
         login_user(user, remember = False)
-        session['external_auth'] = True
+        session['authentication_type'] = 'OAuth'
         return redirect(url_for('index'))
 
     if 'github_token' in session:
-        me = github.get('user')
-        user_info = me.data
-        user = User.query.filter_by(username=user_info['name']).first()
+        me = github.get('user').data
+
+        github_username = me['login']
+        github_name = me['name']
+        github_email = me['email']
+
+        user = User.query.filter_by(username=github_username).first()
         if not user:
-            # create user
-            user = User(username=user_info['name'],
+            user = User(username=github_username,
                         plain_text_password=None,
-                        email=user_info['email'])
+                        firstname=github_name,
+                        lastname='',
+                        email=github_email)
 
             result = user.create_local_user()
             if not result['status']:
@@ -348,18 +331,12 @@ def login():
                 return redirect(url_for('login'))
 
         session['user_id'] = user.id
-        session['external_auth'] = True
+        session['authentication_type'] = 'OAuth'
         login_user(user, remember = False)
         return redirect(url_for('index'))
 
     if request.method == 'GET':
-        return render_template('login.html', github_enabled=GITHUB_ENABLE,
-                                             google_enabled=GOOGLE_ENABLE,
-                                             saml_enabled=SAML_ENABLED,
-                                             ldap_enabled=LDAP_ENABLED,
-                                             login_title=LOGIN_TITLE,
-                                             basic_enabled=BASIC_ENABLED,
-                                             signup_enabled=SIGNUP_ENABLED)
+        return render_template('login.html', saml_enabled=SAML_ENABLED)
 
     # process login
     username = request.form['username']
@@ -373,8 +350,7 @@ def login():
     email = request.form.get('email')
     rpassword = request.form.get('rpassword')
 
-    if auth_method != 'LOCAL':
-        session['external_auth'] = True
+    session['authentication_type'] = 'LDAP' if auth_method != 'LOCAL' else 'LOCAL'
 
     if None in [firstname, lastname, email]:
         #login case
@@ -387,46 +363,18 @@ def login():
         try:
             auth = user.is_validate(method=auth_method, src_ip=request.remote_addr)
             if auth == False:
-                return render_template('login.html', error='Invalid credentials',
-                                                     github_enabled=GITHUB_ENABLE,
-                                                     google_enabled=GOOGLE_ENABLE,
-                                                     saml_enabled=SAML_ENABLED,
-                                                     ldap_enabled=LDAP_ENABLED,
-                                                     login_title=LOGIN_TITLE,
-                                                     basic_enabled=BASIC_ENABLED,
-                                                     signup_enabled=SIGNUP_ENABLED)
+                return render_template('login.html', saml_enabled=SAML_ENABLED, error='Invalid credentials')
         except Exception as e:
-            return render_template('login.html', error=e,
-                                                 github_enabled=GITHUB_ENABLE,
-                                                 google_enabled=GOOGLE_ENABLE,
-                                                 saml_enabled=SAML_ENABLED,
-                                                 ldap_enabled=LDAP_ENABLED,
-                                                 login_title=LOGIN_TITLE,
-                                                 basic_enabled=BASIC_ENABLED,
-                                                 signup_enabled=SIGNUP_ENABLED)
+            return render_template('login.html', saml_enabled=SAML_ENABLED, error=e)
 
         # check if user enabled OPT authentication
         if user.otp_secret:
             if otp_token and otp_token.isdigit():
                 good_token = user.verify_totp(otp_token)
                 if not good_token:
-                    return render_template('login.html', error='Invalid credentials',
-                                                         github_enabled=GITHUB_ENABLE,
-                                                         google_enabled=GOOGLE_ENABLE,
-                                                         saml_enabled=SAML_ENABLED,
-                                                         ldap_enabled=LDAP_ENABLED,
-                                                         login_title=LOGIN_TITLE,
-                                                         basic_enabled=BASIC_ENABLED,
-                                                         signup_enabled=SIGNUP_ENABLED)
+                    return render_template('login.html', saml_enabled=SAML_ENABLED, error='Invalid credentials')
             else:
-                return render_template('login.html', error='Token required',
-                                                     github_enabled=GITHUB_ENABLE,
-                                                     google_enabled=GOOGLE_ENABLE,
-                                                     saml_enabled=SAML_ENABLED,
-                                                     ldap_enabled=LDAP_ENABLED,
-                                                     login_title=LOGIN_TITLE,
-                                                     basic_enabled=BASIC_ENABLED,
-                                                     signup_enabled=SIGNUP_ENABLED)
+                return render_template('login.html', saml_enabled=SAML_ENABLED, error='Token required')
 
         login_user(user, remember = remember_me)
         return redirect(request.args.get('next') or url_for('index'))
@@ -437,34 +385,28 @@ def login():
         # registration case
         user = User(username=username, plain_text_password=password, firstname=firstname, lastname=lastname, email=email)
 
-        # TODO: Move this into the JavaScript
-        # validate password and password confirmation
         if password != rpassword:
             error = "Password confirmation does not match"
             return render_template('register.html', error=error)
 
         try:
             result = user.create_local_user()
-            if result == True:
-                return render_template('login.html', username=username, password=password,
-                                                     github_enabled=GITHUB_ENABLE,
-                                                     google_enabled=GOOGLE_ENABLE,
-                                                     saml_enabled=SAML_ENABLED,
-                                                     ldap_enabled=LDAP_ENABLED,
-                                                     login_title=LOGIN_TITLE,
-                                                     basic_enabled=BASIC_ENABLED,
-                                                     signup_enabled=SIGNUP_ENABLED)
+            if result and result['status']:
+                return render_template('login.html', saml_enabled=SAML_ENABLED, username=username, password=password)
             else:
                 return render_template('register.html', error=result['msg'])
         except Exception as e:
             return render_template('register.html', error=e)
 
+
 def clear_session():
     session.pop('user_id', None)
     session.pop('github_token', None)
     session.pop('google_token', None)
+    session.pop('authentication_type', None)
     session.clear()
     logout_user()
+
 
 @app.route('/logout')
 def logout():
@@ -474,12 +416,13 @@ def logout():
         if app.config.get('SAML_LOGOUT_URL'):
             return redirect(auth.logout(name_id_format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
                                         return_to = app.config.get('SAML_LOGOUT_URL'),
-                            session_index = session['samlSessionIndex'], name_id=session['samlNameId']))
+                                        session_index = session['samlSessionIndex'], name_id=session['samlNameId']))
         return redirect(auth.logout(name_id_format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-                        session_index = session['samlSessionIndex'],
+                                    session_index = session['samlSessionIndex'],
                                     name_id=session['samlNameId']))
     clear_session()
     return redirect(url_for('login'))
+
 
 @app.route('/saml/sls')
 def saml_logout():
@@ -498,12 +441,17 @@ def saml_logout():
     else:
         return render_template('errors/SAML.html', errors=errors)
 
+
 @app.route('/dashboard', methods=['GET', 'POST'])
 @login_required
 def dashboard():
-    if not app.config.get('BG_DOMAIN_UPDATES'):
+    if not Setting().get('pdns_api_url') or not Setting().get('pdns_api_key') or not Setting().get('pdns_version'):
+        return redirect(url_for('admin_setting_pdns'))
+
+    BG_DOMAIN_UPDATE = Setting().get('bg_domain_updates')
+    if not BG_DOMAIN_UPDATE:
         logging.debug('Update domains in foreground')
-        d = Domain().update()
+        Domain().update()
     else:
         logging.debug('Update domains in background')
 
@@ -519,13 +467,13 @@ def dashboard():
     else:
         uptime = 0
 
-    return render_template('dashboard.html', domain_count=domain_count, users=users, history_number=history_number, uptime=uptime, histories=history, dnssec_adm_only=app.config['DNSSEC_ADMINS_ONLY'], pdns_version=app.config['PDNS_VERSION'], show_bg_domain_button=app.config['BG_DOMAIN_UPDATES'])
+    return render_template('dashboard.html', domain_count=domain_count, users=users, history_number=history_number, uptime=uptime, histories=history, show_bg_domain_button=BG_DOMAIN_UPDATE)
 
 
 @app.route('/dashboard-domains', methods=['GET'])
 @login_required
 def dashboard_domains():
-    if current_user.role.name == 'Administrator':
+    if current_user.role.name in ['Administrator', 'Operator']:
         domains = Domain.query
     else:
         domains = User(id=current_user.id).get_domain_query()
@@ -557,7 +505,7 @@ def dashboard_domains():
         start = "" if search.startswith("^") else "%"
         end = "" if search.endswith("$") else "%"
 
-        if current_user.role.name == 'Administrator':
+        if current_user.role.name in ['Administrator', 'Operator']:
             domains = domains.outerjoin(Account).filter(Domain.name.ilike(start + search.strip("^$") + end) |
                                                         Account.name.ilike(start + search.strip("^$") + end) |
                                                         Account.description.ilike(start + search.strip("^$") + end))
@@ -621,36 +569,38 @@ def domain(domain_name):
         # can not get any record, API server might be down
         return redirect(url_for('error', code=500))
 
-    quick_edit = strtobool(Setting().get('allow_quick_edit'))
-
+    quick_edit = Setting().get('record_quick_edit')
+    records_allow_to_edit = Setting().get_records_allow_to_edit()
+    forward_records_allow_to_edit = Setting().get_forward_records_allow_to_edit()
+    reverse_records_allow_to_edit = Setting().get_reverse_records_allow_to_edit()
     records = []
-    #TODO: This should be done in the "model" instead of "view"
-    if NEW_SCHEMA:
+
+    if StrictVersion(Setting().get('pdns_version')) >= StrictVersion('4.0.0'):
         for jr in jrecords:
-            if jr['type'] in app.config['RECORDS_ALLOW_EDIT']:
+            if jr['type'] in records_allow_to_edit:
                 for subrecord in jr['records']:
                     record = Record(name=jr['name'], type=jr['type'], status='Disabled' if subrecord['disabled'] else 'Active', ttl=jr['ttl'], data=subrecord['content'])
                     records.append(record)
         if not re.search('ip6\.arpa|in-addr\.arpa$', domain_name):
-            editable_records = app.config['RECORDS_ALLOW_EDIT']
+            editable_records = forward_records_allow_to_edit
         else:
-            editable_records = app.config['REVERSE_RECORDS_ALLOW_EDIT']
+            editable_records = reverse_records_allow_to_edit
         return render_template('domain.html', domain=domain, records=records, editable_records=editable_records, quick_edit=quick_edit)
     else:
         for jr in jrecords:
-            if jr['type'] in app.config['RECORDS_ALLOW_EDIT']:
+            if jr['type'] in records_allow_to_edit:
                 record = Record(name=jr['name'], type=jr['type'], status='Disabled' if jr['disabled'] else 'Active', ttl=jr['ttl'], data=jr['content'])
                 records.append(record)
     if not re.search('ip6\.arpa|in-addr\.arpa$', domain_name):
-        editable_records = app.config['FORWARD_RECORDS_ALLOW_EDIT']
+        editable_records = forward_records_allow_to_edit
     else:
-        editable_records = app.config['REVERSE_RECORDS_ALLOW_EDIT']
-    return render_template('domain.html', domain=domain, records=records, editable_records=editable_records, quick_edit=quick_edit, pdns_version=app.config['PDNS_VERSION'])
+        editable_records = reverse_records_allow_to_edit
+    return render_template('domain.html', domain=domain, records=records, editable_records=editable_records, quick_edit=quick_edit)
 
 
 @app.route('/admin/domain/add', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@can_create_domain
 def domain_add():
     templates = DomainTemplate.query.all()
     if request.method == 'POST':
@@ -679,6 +629,11 @@ def domain_add():
             if result['status'] == 'ok':
                 history = History(msg='Add domain {0}'.format(domain_name), detail=str({'domain_type': domain_type, 'domain_master_ips': domain_master_ips, 'account_id': account_id}), created_by=current_user.username)
                 history.add()
+
+                # grant user access to the domain
+                Domain(name=domain_name).grant_privileges([current_user.username])
+
+                # apply template if needed
                 if domain_template != '0':
                     template = DomainTemplate.query.filter(DomainTemplate.id == domain_template).first()
                     template_records = DomainTemplateRecord.query.filter(DomainTemplateRecord.template_id == domain_template).all()
@@ -697,8 +652,9 @@ def domain_add():
                 return redirect(url_for('dashboard'))
             else:
                 return render_template('errors/400.html', msg=result['msg']), 400
-        except:
-            logging.error(traceback.print_exc())
+        except Exception as e:
+            logging.error('Cannot add domain. Error: {0}'.format(e))
+            logging.debug(traceback.format_exc())
             return redirect(url_for('error', code=500))
 
     else:
@@ -708,7 +664,7 @@ def domain_add():
 
 @app.route('/admin/domain/<path:domain_name>/delete', methods=['GET'])
 @login_required
-@admin_role_required
+@operator_role_required
 def domain_delete(domain_name):
     d = Domain()
     result = d.delete(domain_name)
@@ -724,7 +680,7 @@ def domain_delete(domain_name):
 
 @app.route('/admin/domain/<path:domain_name>/manage', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def domain_management(domain_name):
     if request.method == 'GET':
         domain = Domain.query.filter(Domain.name == domain_name).first()
@@ -744,12 +700,9 @@ def domain_management(domain_name):
         # username in right column
         new_user_list = request.form.getlist('domain_multi_user[]')
 
-        # get list of user ids to compare
-        d = Domain(name=domain_name)
-        domain_user_ids = d.get_user()
-
         # grant/revoke user privielges
-        d.grant_privielges(new_user_list)
+        d = Domain(name=domain_name)
+        d.grant_privileges(new_user_list)
 
         history = History(msg='Change domain {0} access control'.format(domain_name), detail=str({'user_has_access': new_user_list}), created_by=current_user.username)
         history.add()
@@ -759,13 +712,13 @@ def domain_management(domain_name):
 
 @app.route('/admin/domain/<path:domain_name>/change_soa_setting', methods=['POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def domain_change_soa_edit_api(domain_name):
     domain = Domain.query.filter(Domain.name == domain_name).first()
     if not domain:
         return redirect(url_for('error', code=404))
     new_setting = request.form.get('soa_edit_api')
-    if new_setting == None:
+    if new_setting is None:
         return redirect(url_for('error', code=500))
     if new_setting == '0':
         return redirect(url_for('domain_management', domain_name=domain_name))
@@ -785,21 +738,16 @@ def domain_change_soa_edit_api(domain_name):
 
 @app.route('/admin/domain/<path:domain_name>/change_account', methods=['POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def domain_change_account(domain_name):
     domain = Domain.query.filter(Domain.name == domain_name).first()
     if not domain:
         return redirect(url_for('error', code=404))
 
     account_id = request.form.get('accountid')
-    status = domain.assoc_account(account_id)
+    status = Domain(name=domain.name).assoc_account(account_id)
     if status['status']:
-        users = User.query.all()
-        accounts = Account.query.all()
-        d = Domain(name=domain_name)
-        domain_user_ids = d.get_user()
-        account = d.get_account()
-        return render_template('domain_management.html', domain=domain, users=users, domain_user_ids=domain_user_ids, accounts=accounts, domain_account=account)
+        return redirect(url_for('domain_management', domain_name=domain.name))
     else:
         return redirect(url_for('error', code=500))
 
@@ -838,8 +786,9 @@ def record_apply(domain_name):
             return make_response(jsonify( result ), 200)
         else:
             return make_response(jsonify( result ), 400)
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Canot apply record changes. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return make_response(jsonify( {'status': 'error', 'msg': 'Error when applying new changes'} ), 500)
 
 
@@ -861,22 +810,24 @@ def record_update(domain_name):
             return make_response(jsonify( {'status': 'ok', 'msg': result['msg']} ), 200)
         else:
             return make_response(jsonify( {'status': 'error', 'msg': result['msg']} ), 500)
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Cannot update record. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return make_response(jsonify( {'status': 'error', 'msg': 'Error when applying new changes'} ), 500)
 
 
 @app.route('/domain/<path:domain_name>/record/<path:record_name>/type/<path:record_type>/delete', methods=['GET'])
 @login_required
-@admin_role_required
+@operator_role_required
 def record_delete(domain_name, record_name, record_type):
     try:
         r = Record(name=record_name, type=record_type)
         result = r.delete(domain=domain_name)
         if result['status'] == 'error':
             print(result['msg'])
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Cannot delete record. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return redirect(url_for('error', code=500)), 500
     return redirect(url_for('domain', domain_name=domain_name))
 
@@ -918,14 +869,14 @@ def domain_dnssec_disable(domain_name):
     dnssec = domain.get_domain_dnssec(domain_name)
 
     for key in dnssec['dnssec']:
-        response = domain.delete_dnssec_key(domain_name,key['id']);
+        domain.delete_dnssec_key(domain_name,key['id']);
 
     return make_response(jsonify( { 'status': 'ok', 'msg': 'DNSSEC removed.' } ))
 
 
 @app.route('/domain/<path:domain_name>/managesetting', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_setdomainsetting(domain_name):
     if request.method == 'POST':
         #
@@ -958,15 +909,16 @@ def admin_setdomainsetting(domain_name):
                         return make_response(jsonify( { 'status': 'error', 'msg': 'Unable to create new setting.' } ))
             else:
                 return make_response(jsonify( { 'status': 'error', 'msg': 'Action not supported.' } ), 400)
-        except:
-            logging.error(traceback.print_exc())
+        except Exception as e:
+            logging.error('Cannot change domain setting. Error: {0}'.format(e))
+            logging.debug(traceback.format_exc())
             return make_response(jsonify( { 'status': 'error', 'msg': 'There is something wrong, please contact Administrator.' } ), 400)
 
 
 @app.route('/templates', methods=['GET', 'POST'])
 @app.route('/templates/list', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def templates():
     templates = DomainTemplate.query.all()
     return render_template('template.html', templates=templates)
@@ -974,7 +926,7 @@ def templates():
 
 @app.route('/template/create', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def create_template():
     if request.method == 'GET':
         return render_template('template_add.html')
@@ -990,6 +942,7 @@ def create_template():
             if DomainTemplate.query.filter(DomainTemplate.name == name).first():
                 flash("A template with the name {0} already exists!".format(name), 'error')
                 return redirect(url_for('create_template'))
+
             t = DomainTemplate(name=name, description=description)
             result = t.create()
             if result['status'] == 'ok':
@@ -999,15 +952,15 @@ def create_template():
             else:
                 flash(result['msg'], 'error')
                 return redirect(url_for('create_template'))
-        except:
-            logging.error(traceback.print_exc())
+        except Exception as e:
+            logging.error('Cannot create domain template. Error: {0}'.format(e))
+            logging.debug(traceback.format_exc())
             return redirect(url_for('error', code=500))
-        return redirect(url_for('templates'))
 
 
 @app.route('/template/createfromzone', methods=['POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def create_template_from_zone():
     try:
         jdata = request.json
@@ -1036,16 +989,16 @@ def create_template_from_zone():
                 if zone_info:
                     jrecords = zone_info['records']
 
-                if NEW_SCHEMA:
+                if StrictVersion(Setting().get('pdns_version')) >= StrictVersion('4.0.0'):
                     for jr in jrecords:
-                        if jr['type'] in app.config['RECORDS_ALLOW_EDIT']:
+                        if jr['type'] in Setting().get_records_allow_to_edit():
                             name = '@' if jr['name'] == domain_name else re.sub('\.{}$'.format(domain_name), '', jr['name'])
                             for subrecord in jr['records']:
                                 record = DomainTemplateRecord(name=name, type=jr['type'], status=True if subrecord['disabled'] else False, ttl=jr['ttl'], data=subrecord['content'])
                                 records.append(record)
                 else:
                     for jr in jrecords:
-                        if jr['type'] in app.config['RECORDS_ALLOW_EDIT']:
+                        if jr['type'] in Setting().get_records_allow_to_edit():
                             name = '@' if jr['name'] == domain_name else re.sub('\.{}$'.format(domain_name), '', jr['name'])
                             record = DomainTemplateRecord(name=name, type=jr['type'], status=True if jr['disabled'] else False, ttl=jr['ttl'], data=jr['content'])
                             records.append(record)
@@ -1055,32 +1008,36 @@ def create_template_from_zone():
             if result_records['status'] == 'ok':
                     return make_response(jsonify({'status': 'ok', 'msg': result['msg']}), 200)
             else:
-                result = t.delete_template()
+                t.delete_template()
                 return make_response(jsonify({'status': 'error', 'msg': result_records['msg']}), 500)
 
         else:
             return make_response(jsonify({'status': 'error', 'msg': result['msg']}), 500)
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Cannot create template from zone. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return make_response(jsonify({'status': 'error', 'msg': 'Error when applying new changes'}), 500)
 
 
 @app.route('/template/<path:template>/edit', methods=['GET'])
 @login_required
-@admin_role_required
+@operator_role_required
 def edit_template(template):
     try:
         t = DomainTemplate.query.filter(DomainTemplate.name == template).first()
+        records_allow_to_edit = Setting().get_records_allow_to_edit()
+        quick_edit = Setting().get('record_quick_edit')
         if t is not None:
             records = []
             for jr in t.records:
-                if jr.type in app.config['RECORDS_ALLOW_EDIT']:
-                        record = DomainTemplateRecord(name=jr.name, type=jr.type, status='Disabled' if jr.status else 'Active', ttl=jr.ttl, data=jr.data)
-                        records.append(record)
+                if jr.type in records_allow_to_edit:
+                    record = DomainTemplateRecord(name=jr.name, type=jr.type, status='Disabled' if jr.status else 'Active', ttl=jr.ttl, data=jr.data)
+                    records.append(record)
 
-            return render_template('template_edit.html', template=t.name, records=records, editable_records=app.config['RECORDS_ALLOW_EDIT'])
-    except:
-        logging.error(traceback.print_exc())
+            return render_template('template_edit.html', template=t.name, records=records, editable_records=records_allow_to_edit, quick_edit=quick_edit)
+    except Exception as e:
+        logging.error('Cannot open domain template page. DETAIL: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return redirect(url_for('error', code=500))
     return redirect(url_for('templates'))
 
@@ -1110,14 +1067,15 @@ def apply_records(template):
             return make_response(jsonify(result), 200)
         else:
             return make_response(jsonify(result), 400)
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Cannot apply record changes to the template. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return make_response(jsonify({'status': 'error', 'msg': 'Error when applying new changes'}), 500)
 
 
 @app.route('/template/<path:template>/delete', methods=['GET'])
 @login_required
-@admin_role_required
+@operator_role_required
 def delete_template(template):
     try:
         t = DomainTemplate.query.filter(DomainTemplate.name == template).first()
@@ -1130,16 +1088,20 @@ def delete_template(template):
             else:
                 flash(result['msg'], 'error')
                 return redirect(url_for('templates'))
-    except:
-        logging.error(traceback.print_exc())
+    except Exception as e:
+        logging.error('Cannot delete template. Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return redirect(url_for('error', code=500))
     return redirect(url_for('templates'))
 
 
-@app.route('/admin', methods=['GET', 'POST'])
+@app.route('/admin/pdns', methods=['GET'])
 @login_required
-@admin_role_required
-def admin():
+@operator_role_required
+def admin_pdns():
+    if not Setting().get('pdns_api_url') or not Setting().get('pdns_api_key') or not Setting().get('pdns_version'):
+        return redirect(url_for('admin_setting_pdns'))
+
     domains = Domain.query.all()
     users = User.query.all()
 
@@ -1159,7 +1121,7 @@ def admin():
 @app.route('/admin/user/edit/<user_username>', methods=['GET', 'POST'])
 @app.route('/admin/user/edit', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_edituser(user_username=None):
     if request.method == 'GET':
         if not user_username:
@@ -1198,11 +1160,12 @@ def admin_edituser(user_username=None):
 
 @app.route('/admin/manageuser', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_manageuser():
     if request.method == 'GET':
+        roles = Role.query.all()
         users = User.query.order_by(User.username).all()
-        return render_template('admin_manageuser.html', users=users)
+        return render_template('admin_manageuser.html', users=users, roles=roles)
 
     if request.method == 'POST':
         #
@@ -1245,30 +1208,43 @@ def admin_manageuser():
                 else:
                     return make_response(jsonify( { 'status': 'error', 'msg': 'Cannot revoke user privilege.' } ), 500)
 
-            elif jdata['action'] == 'set_admin':
+            elif jdata['action'] == 'update_user_role':
                 username = data['username']
+                role_name = data['role_name']
+
                 if username == current_user.username:
-                    return make_response(jsonify( { 'status': 'error', 'msg': 'You cannot change you own admin rights.' } ), 400)
-                is_admin = data['is_admin']
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'You cannot change you own roles.' } ), 400)
+
+                user = User.query.filter(User.username==username).first()
+                if not user:
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'User does not exist.' } ), 404)
+
+                if user.role.name == 'Administrator' and current_user.role.name != 'Administrator':
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'You do not have permission to change Administrator users role.' } ), 400)
+
+                if role_name == 'Administrator' and current_user.role.name != 'Administrator':
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'You do not have permission to promote a user to Administrator role.' } ), 400)
+
                 user = User(username=username)
-                result = user.set_admin(is_admin)
-                if result:
-                    history = History(msg='Change user role of {0}'.format(username), created_by=current_user.username)
+                result = user.set_role(role_name)
+                if result['status']:
+                    history = History(msg='Change user role of {0} to {1}'.format(username, role_name), created_by=current_user.username)
                     history.add()
                     return make_response(jsonify( { 'status': 'ok', 'msg': 'Changed user role successfully.' } ), 200)
                 else:
-                    return make_response(jsonify( { 'status': 'error', 'msg': 'Cannot change user role.' } ), 500)
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'Cannot change user role. {0}'.format(result['msg']) } ), 500)
             else:
                 return make_response(jsonify( { 'status': 'error', 'msg': 'Action not supported.' } ), 400)
-        except:
-            logging.error(traceback.print_exc())
+        except Exception as e:
+            logging.error('Cannot update user. Error: {0}'.format(e))
+            logging.debug(traceback.format_exc())
             return make_response(jsonify( { 'status': 'error', 'msg': 'There is something wrong, please contact Administrator.' } ), 400)
 
 
 @app.route('/admin/account/edit/<account_name>', methods=['GET', 'POST'])
 @app.route('/admin/account/edit', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_editaccount(account_name=None):
     users = User.query.all()
 
@@ -1322,7 +1298,7 @@ def admin_editaccount(account_name=None):
 
 @app.route('/admin/manageaccount', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_manageaccount():
     if request.method == 'GET':
         accounts = Account.query.order_by(Account.name).all()
@@ -1346,25 +1322,27 @@ def admin_manageaccount():
                     return make_response(jsonify( { 'status': 'ok', 'msg': 'Account has been removed.' } ), 200)
                 else:
                     return make_response(jsonify( { 'status': 'error', 'msg': 'Cannot remove account.' } ), 500)
-
             else:
                 return make_response(jsonify( { 'status': 'error', 'msg': 'Action not supported.' } ), 400)
-        except:
-            logging.error(traceback.print_exc())
+        except Exception as e:
+            logging.error('Cannot update account. Error: {0}'.format(e))
+            logging.debug(traceback.format_exc())
             return make_response(jsonify( { 'status': 'error', 'msg': 'There is something wrong, please contact Administrator.' } ), 400)
 
 
 @app.route('/admin/history', methods=['GET', 'POST'])
 @login_required
-@admin_role_required
+@operator_role_required
 def admin_history():
     if request.method == 'POST':
+        if current_user.role.name != 'Administrator':
+            return make_response(jsonify( { 'status': 'error', 'msg': 'You do not have permission to remove history.' } ), 401)
+
         h = History()
         result = h.remove_all()
         if result:
             history = History(msg='Remove all histories', created_by=current_user.username)
             history.add()
-
             return make_response(jsonify( { 'status': 'ok', 'msg': 'Changed user role successfully.' } ), 200)
         else:
             return make_response(jsonify( { 'status': 'error', 'msg': 'Can not remove histories.' } ), 500)
@@ -1374,39 +1352,32 @@ def admin_history():
         return render_template('admin_history.html', histories=histories)
 
 
-@app.route('/admin/settings', methods=['GET'])
+@app.route('/admin/setting/basic', methods=['GET'])
 @login_required
-@admin_role_required
-def admin_settings():
+@operator_role_required
+def admin_setting_basic():
     if request.method == 'GET':
-        # start with a copy of the setting defaults (ignore maintenance setting)
-        settings = Setting.defaults.copy()
-        settings.pop('maintenance', None)
+        settings = ['maintenance',
+                    'fullscreen_layout',
+                    'record_helper',
+                    'login_ldap_first',
+                    'default_record_table_size',
+                    'default_domain_table_size',
+                    'auto_ptr',
+                    'record_quick_edit',
+                    'pretty_ipv6_ptr',
+                    'dnssec_admins_only',
+                    'allow_user_create_domain',
+                    'bg_domain_updates',
+                    'site_name'] 
 
-        # update settings info with any customizations
-        for s in settings:
-            value = Setting().get(s)
-            if value is not None:
-                settings[s] = value
-
-        return render_template('admin_settings.html', settings=settings)
+        return render_template('admin_setting_basic.html', settings=settings)
 
 
-@app.route('/admin/setting/<path:setting>/toggle', methods=['POST'])
+@app.route('/admin/setting/basic/<path:setting>/edit', methods=['POST'])
 @login_required
-@admin_role_required
-def admin_settings_toggle(setting):
-    result = Setting().toggle(setting)
-    if (result):
-        return make_response(jsonify( { 'status': 'ok', 'msg': 'Toggled setting successfully.' } ), 200)
-    else:
-        return make_response(jsonify( { 'status': 'error', 'msg': 'Unable to toggle setting.' } ), 500)
-
-
-@app.route('/admin/setting/<path:setting>/edit', methods=['POST'])
-@login_required
-@admin_role_required
-def admin_settings_edit(setting):
+@operator_role_required
+def admin_setting_basic_edit(setting):
     jdata = request.json
     new_value = jdata['value']
     result = Setting().set(setting, new_value)
@@ -1417,48 +1388,172 @@ def admin_settings_edit(setting):
         return make_response(jsonify( { 'status': 'error', 'msg': 'Unable to toggle setting.' } ), 500)
 
 
+@app.route('/admin/setting/basic/<path:setting>/toggle', methods=['POST'])
+@login_required
+@operator_role_required
+def admin_setting_basic_toggle(setting):
+    result = Setting().toggle(setting)
+    if (result):
+        return make_response(jsonify( { 'status': 'ok', 'msg': 'Toggled setting successfully.' } ), 200)
+    else:
+        return make_response(jsonify( { 'status': 'error', 'msg': 'Unable to toggle setting.' } ), 500)
+
+
+@app.route('/admin/setting/pdns', methods=['GET', 'POST'])
+@login_required
+@admin_role_required
+def admin_setting_pdns():
+    if request.method == 'GET':
+        pdns_api_url = Setting().get('pdns_api_url')
+        pdns_api_key = Setting().get('pdns_api_key')
+        pdns_version = Setting().get('pdns_version')
+        return render_template('admin_setting_pdns.html', pdns_api_url=pdns_api_url, pdns_api_key=pdns_api_key, pdns_version=pdns_version)
+    elif request.method == 'POST':
+        pdns_api_url = request.form.get('pdns_api_url')
+        pdns_api_key = request.form.get('pdns_api_key')
+        pdns_version = request.form.get('pdns_version')
+
+        Setting().set('pdns_api_url', pdns_api_url)
+        Setting().set('pdns_api_key', pdns_api_key)
+        Setting().set('pdns_version', pdns_version)
+
+        return render_template('admin_setting_pdns.html', pdns_api_url=pdns_api_url, pdns_api_key=pdns_api_key, pdns_version=pdns_version)
+
+
+@app.route('/admin/setting/dns-records', methods=['GET', 'POST'])
+@login_required
+@operator_role_required
+def admin_setting_records():
+    if request.method == 'GET':
+        _fr = Setting().get('forward_records_allow_edit')
+        _rr = Setting().get('reverse_records_allow_edit')
+        f_records = literal_eval(_fr) if isinstance(_fr, str) else _fr
+        r_records = literal_eval(_rr) if isinstance(_rr, str) else _rr
+
+        return render_template('admin_setting_records.html', f_records=f_records, r_records=r_records)
+    elif request.method == 'POST':
+        fr = {}
+        rr = {}
+        records = Setting().defaults['forward_records_allow_edit']
+        for r in records:
+            fr[r] = True if request.form.get('fr_{0}'.format(r.lower())) else False
+            rr[r] = True if request.form.get('rr_{0}'.format(r.lower())) else False
+
+        Setting().set('forward_records_allow_edit', str(fr))
+        Setting().set('reverse_records_allow_edit', str(rr))
+        return redirect(url_for('admin_setting_records'))
+
+
+@app.route('/admin/setting/authentication', methods=['GET', 'POST'])
+@login_required
+@admin_role_required
+def admin_setting_authentication():
+    if request.method == 'GET':
+        return render_template('admin_setting_authentication.html')
+    elif request.method == 'POST':
+        conf_type = request.form.get('config_tab')
+        result = None
+
+        if conf_type == 'general':
+            local_db_enabled = True if request.form.get('local_db_enabled') else False
+            signup_enabled = True if request.form.get('signup_enabled', ) else False
+
+            if not local_db_enabled and not Setting().get('ldap_enabled'):
+                result = {'status': False, 'msg': 'Local DB and LDAP Authentication can not be disabled at the same time.'}
+            else:
+                Setting().set('local_db_enabled', local_db_enabled)
+                Setting().set('signup_enabled', signup_enabled)
+                result = {'status': True, 'msg': 'Saved successfully'}
+        elif conf_type == 'ldap':
+            ldap_enabled = True if request.form.get('ldap_enabled') else False
+
+            if not ldap_enabled and not Setting().get('local_db_enabled'):
+                result = {'status': False, 'msg': 'Local DB and LDAP Authentication can not be disabled at the same time.'}
+            else:
+                Setting().set('ldap_enabled', ldap_enabled)
+                Setting().set('ldap_type', request.form.get('ldap_type'))
+                Setting().set('ldap_uri', request.form.get('ldap_uri'))
+                Setting().set('ldap_base_dn', request.form.get('ldap_base_dn'))
+                Setting().set('ldap_admin_username', request.form.get('ldap_admin_username'))
+                Setting().set('ldap_admin_password', request.form.get('ldap_admin_password'))
+                Setting().set('ldap_filter_basic', request.form.get('ldap_filter_basic'))
+                Setting().set('ldap_filter_username', request.form.get('ldap_filter_username'))
+                Setting().set('ldap_sg_enabled', True if request.form.get('ldap_sg_enabled')=='ON' else False)
+                Setting().set('ldap_admin_group', request.form.get('ldap_admin_group'))
+                Setting().set('ldap_operator_group', request.form.get('ldap_operator_group'))
+                Setting().set('ldap_user_group', request.form.get('ldap_user_group'))
+                result = {'status': True, 'msg': 'Saved successfully'}
+        elif conf_type == 'google':
+            Setting().set('google_oauth_enabled', True if request.form.get('google_oauth_enabled') else False)
+            Setting().set('google_oauth_client_id', request.form.get('google_oauth_client_id'))
+            Setting().set('google_oauth_client_secret', request.form.get('google_oauth_client_secret'))
+            Setting().set('google_token_url', request.form.get('google_token_url'))
+            Setting().set('google_token_params', request.form.get('google_token_params'))
+            Setting().set('google_authorize_url', request.form.get('google_authorize_url'))
+            Setting().set('google_base_url', request.form.get('google_base_url'))
+            result = {'status': True, 'msg': 'Saved successfully. Please reload PDA to take effect.'}
+        elif conf_type == 'github':
+            Setting().set('github_oauth_enabled', True if request.form.get('github_oauth_enabled') else False)
+            Setting().set('github_oauth_key', request.form.get('github_oauth_key'))
+            Setting().set('github_oauth_secret', request.form.get('github_oauth_secret'))
+            Setting().set('github_oauth_scope', request.form.get('github_oauth_scope'))
+            Setting().set('github_oauth_api_url', request.form.get('github_oauth_api_url'))
+            Setting().set('github_oauth_token_url', request.form.get('github_oauth_token_url'))
+            Setting().set('github_oauth_authorize_url', request.form.get('github_oauth_authorize_url'))
+            result = {'status': True, 'msg': 'Saved successfully. Please reload PDA to take effect.'}
+        else:
+            return abort(400)
+
+        return render_template('admin_setting_authentication.html', result=result)
+
+
 @app.route('/user/profile', methods=['GET', 'POST'])
 @login_required
 def user_profile():
-    external_account = False
-    if 'external_auth' in session:
-        external_account = session['external_auth']
-    if request.method == 'GET' or external_account:
-        return render_template('user_profile.html', external_account=external_account)
+    if request.method == 'GET':
+        return render_template('user_profile.html')
     if request.method == 'POST':
-        # get new profile info
-        firstname = request.form['firstname'] if 'firstname' in request.form else ''
-        lastname = request.form['lastname'] if 'lastname' in request.form else ''
-        email = request.form['email'] if 'email' in request.form else ''
-        new_password = request.form['password'] if 'password' in request.form else ''
+        if session['authentication_type'] == 'LOCAL':
+            firstname = request.form['firstname'] if 'firstname' in request.form else ''
+            lastname = request.form['lastname'] if 'lastname' in request.form else ''
+            email = request.form['email'] if 'email' in request.form else ''
+            new_password = request.form['password'] if 'password' in request.form else ''
+        else:
+            firstname = lastname = email = new_password = ''
+            logging.warning('Authenticated externally. User {0} information will not allowed to update the profile'.format(current_user.username))
 
-        # json data
         if request.data:
             jdata = request.json
             data = jdata['data']
             if jdata['action'] == 'enable_otp':
-                enable_otp = data['enable_otp']
-                user = User(username=current_user.username)
-                user.update_profile(enable_otp=enable_otp)
-                return make_response(jsonify( { 'status': 'ok', 'msg': 'Change OTP Authentication successfully. Status: {0}'.format(enable_otp) } ), 200)
+                if session['authentication_type'] in ['LOCAL', 'LDAP']:
+                    enable_otp = data['enable_otp']
+                    user = User(username=current_user.username)
+                    user.update_profile(enable_otp=enable_otp)
+                    return make_response(jsonify( { 'status': 'ok', 'msg': 'Change OTP Authentication successfully. Status: {0}'.format(enable_otp) } ), 200)
+                else:
+                    return make_response(jsonify( { 'status': 'error', 'msg': 'User {0} is externally. You are not allowed to update the OTP'.format(current_user.username) } ), 400)
 
         # get new avatar
         save_file_name = None
         if 'file' in request.files:
-            file = request.files['file']
-            if file:
-                filename = secure_filename(file.filename)
-                file_extension = filename.rsplit('.', 1)[1]
+            if session['authentication_type'] in ['LOCAL', 'LDAP']:
+                file = request.files['file']
+                if file:
+                    filename = secure_filename(file.filename)
+                    file_extension = filename.rsplit('.', 1)[1]
 
-                if file_extension.lower() in ['jpg', 'jpeg', 'png']:
-                    save_file_name = current_user.username + '.' + file_extension
-                    file.save(os.path.join(app.config['UPLOAD_DIR'], 'avatar', save_file_name))
+                    if file_extension.lower() in ['jpg', 'jpeg', 'png']:
+                        save_file_name = current_user.username + '.' + file_extension
+                        file.save(os.path.join(app.config['UPLOAD_DIR'], 'avatar', save_file_name))
+            else:
+                logging.error('Authenticated externally. User {0} is not allowed to update the avatar')
+                abort(400)
 
-        # update user profile
         user = User(username=current_user.username, plain_text_password=new_password, firstname=firstname, lastname=lastname, email=email, avatar=save_file_name, reload_info=False)
         user.update_profile()
 
-        return render_template('user_profile.html', external_account=external_account)
+        return render_template('user_profile.html')
 
 
 @app.route('/user/avatar/<path:filename>')
@@ -1506,7 +1601,9 @@ def dyndns_update():
     try:
         # get all domains owned by the current user
         domains = User(id=current_user.id).get_domain()
-    except:
+    except Exception as e:
+        logging.error('DynDNS Error: {0}'.format(e))
+        logging.debug(traceback.format_exc())
         return render_template('dyndns.html', response='911'), 200
 
     domain = None

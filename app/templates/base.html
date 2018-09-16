@@ -4,7 +4,7 @@
   {% block head %}
   <meta charset="utf-8">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
-  {% block title %}<title>DNS Control Panel</title>{% endblock %}
+  {% block title %}<title>{{ SITE_NAME }}</title>{% endblock %}
   <!--  Get Google Fonts we like -->
   <link rel="stylesheet" href="//fonts.googleapis.com/css?family=Source+Sans+Pro:300,400,600,700,300italic,400italic,600italic">
   <link rel="stylesheet" href="//fonts.googleapis.com/css?family=Roboto+Mono:400,300,700">
@@ -21,7 +21,7 @@
   <![endif]-->
   {% endblock %}
 </head>
-<body class="hold-transition skin-blue sidebar-mini {% if not fullscreen_layout_setting %}layout-boxed{% endif %}">
+<body class="hold-transition skin-blue sidebar-mini {% if not SETTING.get('fullscreen_layout') %}layout-boxed{% endif %}">
 <div class="wrapper">
   {% block pageheader %}
   <header class="main-header">
@@ -70,10 +70,10 @@
               <!-- Menu Footer-->
               <li class="user-footer">
                 <div class="pull-left">
-                  <a href="{{ url_for('user_profile') }}" class="btn btn-flat btn-default">My Profile</a>
+                  <a href="{{ url_for('user_profile') }}" class="btn btn-flat btn-primary">My Profile</a>
                 </div>
                 <div class="pull-right">
-                  <a href="{{ url_for('logout') }}" class="btn btn-flat btn-default">Log out</a>
+                  <a href="{{ url_for('logout') }}" class="btn btn-flat btn-warning">Log out</a>
                 </div>
               </li>
             </ul>
@@ -105,17 +105,49 @@
       <!-- sidebar menu: : style can be found in sidebar.less -->
       <ul class="sidebar-menu" data-widget="tree">
         <li class="header">USER ACTIONS</li>
-        <li><a href="{{ url_for('dashboard') }}"><i class="fa fa-dashboard"></i> <span>Dashboard</span></a></li>
-        {% if current_user.role.name == 'Administrator' %}
-        <li><a href="{{ url_for('domain_add') }}"><i class="fa fa-plus"></i> <span>New Domain</span></a></li>
-        <li class="header">ADMINISTRATION</li>
-        <li><a href="{{ url_for('admin') }}"><i class="fa fa-wrench"></i> <span>Admin Console</span></a></li>
-        <li><a href="{{ url_for('templates') }}"><i class="fa fa-clone"></i> <span>Domain Templates</span></a></li>
-        <li><a href="{{ url_for('admin_manageuser') }}"><i class="fa fa-users"></i> <span>Users</span></a></li>
-        <li><a href="{{ url_for('admin_manageaccount') }}"><i class="fa fa-industry"></i> <span>Accounts</span></a></li>
-        <li><a href="{{ url_for('admin_history') }}"><i class="fa fa-calendar"></i> <span>History</span></a></li>
-        <li><a href="{{ url_for('admin_settings') }}"><i class="fa fa-cog"></i> <span>Settings</span></a></li>
+        <li class="{{ 'active' if active_page == 'dashboard' else '' }}">
+          <a href="{{ url_for('dashboard') }}"><i class="fa fa-dashboard"></i> <span>Dashboard</span></a>
+        </li>
+        {% if SETTING.get('allow_user_create_domain') or current_user.role.name in ['Administrator', 'Operator'] %}
+        <li class="{{ 'active' if active_page == 'new_domain' else '' }}">
+          <a href="{{ url_for('domain_add') }}"><i class="fa fa-plus"></i> <span>New Domain</span></a>
+        </li>
         {% endif %}
+        {% if current_user.role.name in ['Administrator', 'Operator'] %}
+        <li class="header">ADMINISTRATION</li>
+        <li class="{{ 'active' if active_page == 'admin_console' else '' }}">
+          <a href="{{ url_for('admin_pdns') }}"><i class="fa fa-info-circle"></i> <span>PDNS</span></a>
+        </li>
+        <li class="{{ 'active' if active_page == 'admin_history' else '' }}">
+          <a href="{{ url_for('admin_history') }}"><i class="fa fa-calendar"></i> <span>History</span></a>
+        </li>
+        <li class="{{ 'active' if active_page == 'admin_domain_template' else '' }}">
+          <a href="{{ url_for('templates') }}"><i class="fa fa-clone"></i> <span>Domain Templates</span></a>
+        </li>
+        <li class="{{ 'active' if active_page == 'admin_accounts' else '' }}">
+          <a href="{{ url_for('admin_manageaccount') }}"><i class="fa fa-industry"></i> <span>Accounts</span></a>
+        </li>
+        <li class="{{ 'active' if active_page == 'admin_users' else '' }}">
+          <a href="{{ url_for('admin_manageuser') }}"><i class="fa fa-users"></i> <span>Users</span></a>
+        </li>          
+        <li class="{{ 'treeview active' if active_page == 'admin_settings' else 'treeview' }}">
+          <a href="#">
+            <i class="fa fa-cog"></i> <span>Settings</span>
+            <span class="pull-right-container">
+              <i class="fa fa-angle-left pull-right"></i>
+            </span>
+          </a>
+          <ul class="treeview-menu" {% if active_page == 'admin_settings' %}style="display: block;"{% endif %}>
+            <li><a href="{{ url_for('admin_setting_basic') }}"><i class="fa fa-circle-o"></i></i> <span>Basic</span></a></li>
+            <li><a href="{{ url_for('admin_setting_records') }}"><i class="fa fa-circle-o"></i> <span>Records</span></a></li>
+            {% if current_user.role.name == 'Administrator' %}
+            <li><a href="{{ url_for('admin_setting_pdns') }}"><i class="fa fa-circle-o"></i> <span>PDNS</a></li>
+            <li><a href="{{ url_for('admin_setting_authentication') }}"><i class="fa fa-circle-o"></i> <span>Authentication</span></a></li>
+            {% endif %}
+          </ul>
+        </li>
+        {% endif %}
+      </ul>
     {% endif %}
     </section>
     <!-- /.sidebar -->
@@ -146,7 +178,7 @@
 </div>
 <!-- ./wrapper -->
 <script type="text/javascript">
-	$SCRIPT_ROOT = {{ request.script_root|tojson|safe }};
+  $SCRIPT_ROOT = {{ request.script_root|tojson|safe }};
 </script>
 {% block scripts %}
 {% assets "js_main" -%}
