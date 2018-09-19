@@ -1,7 +1,7 @@
-version: '3.7'
+version: '3'
 
 services:
-  pdns-db-master:
+  db-master:
     image: bitnami/mariadb:latest
     ports:
       - '3306'
@@ -14,7 +14,7 @@ services:
       - MARIADB_USER=${PDNS_DB_USER}
       - MARIADB_PASSWORD=${PDNS_DB_PASSWORD}
     networks:
-      internal:
+      internal-db:
     volumes:
       - '${PDNS_DB_DATA_PATH}:/bitnami'
     healthcheck:
@@ -22,23 +22,27 @@ services:
       timeout: 10s
       retries: 5
 
-  pdns-db-slave:
+  db-slave:
     image: 'bitnami/mariadb:latest'
     ports:
       - '3306'
     depends_on:
-      - pdns-db-master
+      - db-master
     environment:
       - MARIADB_REPLICATION_MODE=slave
       - MARIADB_REPLICATION_USER=repl_user
       - MARIADB_REPLICATION_PASSWORD=repl_password
-      - MARIADB_MASTER_HOST=pdns-db-master
+      - MARIADB_MASTER_HOST=db-master
       - MARIADB_MASTER_PORT_NUMBER=3306
       - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
     networks:
-      internal:
+      internal-db:
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 5
 
-  pdns-admin-db-master:
+  admin-db-master:
     image: bitnami/mariadb:latest
     ports:
       - '3306'
@@ -51,7 +55,7 @@ services:
       - MARIADB_USER=${PDA_DB_USER}
       - MARIADB_PASSWORD=${PDA_DB_PASSWORD}
     networks:
-      internal:
+      internal-db:
     volumes:
       - '${PDA_DB_DATA_PATH}:/bitnami'
     healthcheck:
@@ -59,54 +63,56 @@ services:
       timeout: 10s
       retries: 5
 
-  pdns-admin-db-slave:
+  admin-db-slave:
     image: 'bitnami/mariadb:latest'
     ports:
       - '3306'
     depends_on:
-      - pdns-admin-db-master
+      - admin-db-master
     environment:
       - MARIADB_REPLICATION_MODE=slave
       - MARIADB_REPLICATION_USER=repl_user
       - MARIADB_REPLICATION_PASSWORD=repl_password
-      - MARIADB_MASTER_HOST=pdns-admin-db-master
+      - MARIADB_MASTER_HOST=admin-db-master
       - MARIADB_MASTER_PORT_NUMBER=3306
       - MARIADB_MASTER_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
     networks:
-      internal:
+      internal-db:
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 5
 
-  pdns:
+  authoritative:
     image: psitrax/powerdns:latest
+    restart: always
     ports:
       - '5300:53'
       - '5300:53/udp'
     links: 
-      - pdns-db-master:db
+      - db-master:db 
     command: [
-      '--api=yes', '--api-key=${PDNS_API_KEY}',
-      '--loglevel=${PDNS_LOGLEVEL}', 
-      '--log-dns-details=${PDNS_LOG_DNS_DETAILS}', '--log-dns-queries=${PDNS_LOG_DNS_QUERIES}',
+      '--api=yes', '--api-key=${PDNS_API_KEY}', 
+      '--disable-axfr=${PDNS_DISABLE_AXFR}', '--allow-axfr-ips=${PDNS_ALLOW_AXFR_IPS}',
+      '--master=${PDNS_MASTER}', '--slave=${PDNS_SLAVE}', '--slave-cycle-interval=${PDNS_SLAVE_CYCLE_INTERNAL}',
+      '--loglevel=${PDNS_LOGLEVEL}', '--log-dns-details=${PDNS_LOG_DNS_DETAILS}', '--log-dns-queries=${PDNS_LOG_DNS_QUERIES}',
       '--webserver-address=0.0.0.0', '--webserver-allow-from=0.0.0.0/0']
     depends_on: 
-      - pdns-db-master
+      - db-master
     environment:
       - MYSQL_HOST=db
       - MYSQL_USER=${PDNS_DB_USER}
       - MYSQL_PASS=${PDNS_DB_PASSWORD}
     networks:
       internal:
-        ipv4_address: ${DOCKER_PDNS_AUTHORITATIVE_IP}
+        ipv4_address: ${DOCKER_PDNS_IP}
+      internal-db:
 
-  pdns-recursor:
-    build:
-      context: .
-      dockerfile: docker/pdns-recursor/Dockerfile
-    image: pdns-recursor
+  recursor:
+    image: xyzxyz442/pdns-recursor:latest
     ports:
       - '53:53/tcp'
       - '53:53/udp'
-    depends_on:
-      - pdns
     environment:
       - PDNS_forward_zones=${PDNS_RECURSOR_FORWARD_ZONES}
       - PDNS_forward_zones_recurse=${PDNS_RECURSOR_FORWARD_ZONES}
@@ -115,7 +121,7 @@ services:
     networks:
       internal:
 
-  pdns-admin:
+  admin:
     build:
       context: .
       dockerfile: docker/PowerDNS-Admin/Dockerfile
@@ -125,10 +131,10 @@ services:
     ports:
       - '9191:9191'
     links: 
-      - pdns-admin-db-master:db-admin
+      - admin-db-master:db-admin
     depends_on:
-      - pdns
-      - pdns-admin-db-master
+      - authoritative
+      - admin-db-master
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
       - PDA_DB_HOST=db-admin
@@ -140,6 +146,7 @@ services:
       - FLASK_APP=/powerdns-admin/app/__init__.py
     networks:
       internal:
+      internal-db:
     volumes:
       # Code
       - .:/powerdns-admin/
@@ -147,7 +154,7 @@ services:
       # Assets dir volume
       - powerdns-admin-assets:/powerdns-admin/app/static
       - powerdns-admin-assets2:/powerdns-admin/node_modules
-      - '${PDNS_ADMIN_LOGS_PATH}:/powerdns-admin/logs'
+      - '${PDA_LOGS_PATH}:/powerdns-admin/logs'
       - ./app/static/custom:/powerdns-admin/app/static/custom
     logging:
       driver: json-file
@@ -160,6 +167,11 @@ networks:
     ipam:
       config:
         - subnet: ${DOCKER_SUBNET}
+  internal-db:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_DB_SUBNET}
 
 volumes:
   powerdns-admin-assets:

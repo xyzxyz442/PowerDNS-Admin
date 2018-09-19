@@ -1,17 +1,17 @@
 version: '3.7'
 
 services:
-  pdns-db-master:
+  db-master:
     restart: always
-  pdns-db-slave:
+  db-slave:
     restart: always
-  pdns-admin-db-master:
+  admin-db-master:
     restart: always
-  pdns-admin-db-slave:
+  admin-db-slave:
     restart: always
-  pdns:
+  authoritative:
     restart: always
-  pdns-recursor:
+  recursor:
     restart: always
-  pdns-admin:
+  admin:
     restart: always
